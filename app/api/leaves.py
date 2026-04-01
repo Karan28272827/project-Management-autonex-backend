@@ -1,0 +1,419 @@
+import json
+import os
+from datetime import timedelta
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List, Optional
+
+from app.db.database import get_db
+from app.constants.leave_types import RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type
+from app.models.allocation import Allocation
+from app.models.employee import Employee
+from app.models.leave import Leave
+from app.models.parent_project import MainProject
+from app.models.project import DailySheet
+from app.models.sub_project import SubProject
+from app.models.user import User
+from app.schemas.leave import Leave as LeaveSchema, LeaveCreate
+from app.services.slack_service import (
+    get_or_cache_employee_slack_user_id,
+    try_get_or_cache_employee_slack_user_id,
+    try_send_leave_applied_message,
+    try_send_pm_leave_request_message,
+    try_send_leave_status_message,
+)
+
+router = APIRouter(prefix="/api/leaves", tags=["Leaves"])
+
+
+def get_razorpay_leave_type(local_leave_type: str) -> int:
+    normalized = normalize_leave_type(local_leave_type)
+    return RAZORPAY_LEAVE_TYPE_IDS.get(normalized, 0)
+
+
+def post_razorpay_attendance(request_body: dict) -> str:
+    razorpay_api_id = os.getenv("RAZORPAY_API_ID")
+    razorpay_api_key = os.getenv("RAZORPAY_API_KEY")
+
+    if not razorpay_api_id or not razorpay_api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Razorpay payroll credentials are not configured on the backend",
+        )
+
+    request_body["auth"] = {
+        "id": int(razorpay_api_id),
+        "key": razorpay_api_key,
+    }
+
+    request = Request(
+        "https://payroll.razorpay.com/api/att",
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=20) as response:
+            return response.read().decode("utf-8", errors="ignore")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore") or exc.reason
+        raise HTTPException(status_code=502, detail=f"Razorpay leave sync failed: {detail}")
+    except URLError as exc:
+        raise HTTPException(status_code=502, detail=f"Razorpay leave sync failed: {exc.reason}")
+
+
+def build_razorpay_attendance_request(employee: Employee, date_value, leave_type: str, remarks: str) -> dict:
+    if not employee.razorpay_email:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Razorpay Email is missing for {employee.name}",
+        )
+
+    return {
+        "request": {
+            "type": "attendance",
+            "sub-type": "modify",
+        },
+        "data": {
+            "email": employee.razorpay_email,
+            "employee-type": "employee",
+            "date": date_value.isoformat(),
+            "status": "leave",
+            "leave-type": get_razorpay_leave_type(leave_type),
+            "remarks": remarks,
+        },
+    }
+
+
+def sync_leave_to_razorpay(employee: Employee, leave: Leave) -> None:
+    remarks = leave.reason or f"{get_leave_type_label(leave.leave_type)} request from Autonex"
+    current_date = leave.start_date
+
+    while current_date <= leave.end_date:
+        request_body = build_razorpay_attendance_request(
+            employee=employee,
+            date_value=current_date,
+            leave_type=leave.leave_type,
+            remarks=remarks,
+        )
+        post_razorpay_attendance(request_body)
+        current_date += timedelta(days=1)
+
+
+def _date_ranges_overlap(start_a, end_a, start_b, end_b) -> bool:
+    return start_a <= end_b and start_b <= end_a
+
+
+def _format_impacted_project_line(project: DailySheet, allocation: Allocation, sub_project: SubProject | None) -> str:
+    sub_project_name = sub_project.name if sub_project else "Unmapped sub-project"
+    hours = allocation.total_daily_hours or 0
+    roles = ", ".join(allocation.role_tags or []) or "No role tags"
+    return f"{project.name} ({sub_project_name}) - {hours}h/day - Roles: {roles}"
+
+
+def _get_pm_notification_targets(db: Session, employee: Employee, leave: Leave) -> list[dict]:
+    allocations = db.query(Allocation).filter(Allocation.employee_id == employee.id).all()
+    if not allocations:
+        return []
+
+    project_ids = list({allocation.sub_project_id for allocation in allocations if allocation.sub_project_id})
+    if not project_ids:
+        return []
+
+    projects = db.query(DailySheet).filter(DailySheet.id.in_(project_ids)).all()
+    project_map = {project.id: project for project in projects}
+
+    sub_project_ids = list({project.sub_project_id for project in projects if project.sub_project_id})
+    sub_projects = db.query(SubProject).filter(SubProject.id.in_(sub_project_ids)).all() if sub_project_ids else []
+    sub_project_map = {sub_project.id: sub_project for sub_project in sub_projects}
+
+    main_project_ids = list({project.main_project_id for project in projects if project.main_project_id})
+    main_projects = db.query(MainProject).filter(MainProject.id.in_(main_project_ids)).all() if main_project_ids else []
+    main_project_map = {main_project.id: main_project for main_project in main_projects}
+
+    pm_project_map: dict[int, list[str]] = {}
+    for allocation in allocations:
+        project = project_map.get(allocation.sub_project_id)
+        if not project:
+            continue
+
+        allocation_start = allocation.active_start_date or project.start_date
+        allocation_end = allocation.active_end_date or project.end_date
+        if not allocation_start or not allocation_end:
+            continue
+
+        if not _date_ranges_overlap(leave.start_date, leave.end_date, allocation_start, allocation_end):
+            continue
+
+        sub_project = sub_project_map.get(project.sub_project_id) if project.sub_project_id else None
+        main_project = main_project_map.get(project.main_project_id) if project.main_project_id else None
+        pm_ids = {
+            pm_id
+            for pm_id in (
+                getattr(sub_project, "pm_id", None),
+                getattr(main_project, "program_manager_id", None),
+            )
+            if pm_id
+        }
+        if not pm_ids:
+            continue
+
+        project_line = _format_impacted_project_line(project, allocation, sub_project)
+        for pm_id in pm_ids:
+            pm_project_map.setdefault(pm_id, [])
+            if project_line not in pm_project_map[pm_id]:
+                pm_project_map[pm_id].append(project_line)
+
+    if not pm_project_map:
+        return []
+
+    pm_employees = db.query(Employee).filter(Employee.id.in_(pm_project_map.keys())).all()
+    notification_targets = []
+    for pm_employee in pm_employees:
+        slack_user_id = try_get_or_cache_employee_slack_user_id(db, pm_employee)
+        if not slack_user_id:
+            continue
+        notification_targets.append(
+            {
+                "pm_employee": pm_employee,
+                "pm_slack_user_id": slack_user_id,
+                "impacted_projects": pm_project_map.get(pm_employee.id, []),
+            }
+        )
+
+    return notification_targets
+
+
+@router.get("", response_model=List[LeaveSchema])
+def get_all_leaves(
+    employee_id: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    """Get all leaves, optionally filtered by employee_id"""
+    query = db.query(Leave)
+    if employee_id:
+        query = query.filter(Leave.employee_id == employee_id)
+    
+    leaves = query.all()
+    return [
+        LeaveSchema(
+            leave_id=leave.id,
+            employee_id=leave.employee_id,
+            start_date=leave.start_date,
+            end_date=leave.end_date,
+            leave_type=leave.leave_type,
+            reason=leave.reason,
+            status=leave.status or "pending",
+            approved_by=leave.approved_by,
+            razorpay_applied=leave.razorpay_applied or False,
+        )
+        for leave in leaves
+    ]
+
+
+@router.get("/{leave_id}", response_model=LeaveSchema)
+def get_leave(leave_id: int, db: Session = Depends(get_db)):
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+    return LeaveSchema(
+        leave_id=leave.id,
+        employee_id=leave.employee_id,
+        start_date=leave.start_date,
+        end_date=leave.end_date,
+        leave_type=leave.leave_type,
+        reason=leave.reason,
+        status=leave.status or "pending",
+        approved_by=leave.approved_by,
+        razorpay_applied=leave.razorpay_applied or False,
+    )
+
+
+@router.post("", response_model=LeaveSchema, status_code=201)
+def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
+    employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    leave = Leave(
+        employee_id=payload.employee_id,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        leave_type=payload.leave_type,
+        reason=payload.reason,
+        status="pending",
+    )
+    db.add(leave)
+    db.commit()
+    db.refresh(leave)
+
+    employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
+
+    try_send_leave_applied_message(
+        employee_name=employee.name,
+        employee_email=employee.email,
+        leave_type=get_leave_type_label(leave.leave_type),
+        start_date=leave.start_date.isoformat(),
+        end_date=leave.end_date.isoformat(),
+    )
+
+    duration_days = (leave.end_date - leave.start_date).days + 1
+    for target in _get_pm_notification_targets(db, employee, leave):
+        try_send_pm_leave_request_message(
+            pm_slack_user_id=target["pm_slack_user_id"],
+            pm_name=target["pm_employee"].name,
+            employee_name=employee.name,
+            employee_email=employee.email,
+            employee_designation=employee.designation,
+            leave_type=get_leave_type_label(leave.leave_type),
+            start_date=leave.start_date.isoformat(),
+            end_date=leave.end_date.isoformat(),
+            duration_days=duration_days,
+            reason=leave.reason,
+            impacted_projects=target["impacted_projects"],
+        )
+
+    return LeaveSchema(
+        leave_id=leave.id,
+        employee_id=leave.employee_id,
+        start_date=leave.start_date,
+        end_date=leave.end_date,
+        leave_type=leave.leave_type,
+        reason=leave.reason,
+        status=leave.status or "pending",
+        approved_by=leave.approved_by,
+        razorpay_applied=leave.razorpay_applied or False,
+    )
+
+
+@router.post("/{leave_id}/apply-to-razorpay")
+def apply_leave_to_razorpay(leave_id: int, db: Session = Depends(get_db)):
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+
+    if (leave.status or "pending") != "approved":
+        raise HTTPException(status_code=400, detail="Only approved leaves can be applied to Razorpay")
+    if leave.razorpay_applied:
+        raise HTTPException(status_code=400, detail="Leave has already been applied to Razorpay")
+
+    employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    sync_leave_to_razorpay(employee, leave)
+    leave.razorpay_applied = True
+    db.commit()
+    return {"message": "Leave submitted to Razorpay", "leave_id": leave_id}
+
+
+@router.put("/{leave_id}", response_model=LeaveSchema)
+def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_db)):
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+    leave.employee_id = payload.employee_id
+    leave.start_date = payload.start_date
+    leave.end_date = payload.end_date
+    leave.leave_type = payload.leave_type
+    leave.reason = payload.reason
+    db.commit()
+    db.refresh(leave)
+    return LeaveSchema(
+        leave_id=leave.id,
+        employee_id=leave.employee_id,
+        start_date=leave.start_date,
+        end_date=leave.end_date,
+        leave_type=leave.leave_type,
+        reason=leave.reason,
+        status=leave.status or "pending",
+        approved_by=leave.approved_by,
+        razorpay_applied=leave.razorpay_applied or False,
+    )
+
+
+# ── Approve / Reject ───────────────────────────────────────────────
+
+@router.patch("/{leave_id}/approve")
+def approve_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_db)):
+    """Approve a leave request. Pass approved_by as query param (user_id)."""
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+
+    employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if not leave.razorpay_applied:
+        sync_leave_to_razorpay(employee, leave)
+        leave.razorpay_applied = True
+
+    leave.status = "approved"
+    leave.approved_by = approved_by
+    db.commit()
+    employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
+
+    approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
+    pm_name = approver.name if approver and approver.name else "your PM"
+
+    try_send_leave_status_message(
+        employee_email=employee.email,
+        employee_name=employee.name,
+        start_date=leave.start_date.isoformat(),
+        end_date=leave.end_date.isoformat(),
+        pm_name=pm_name,
+        approved=True,
+    )
+
+    return {
+        "message": "Leave approved and synced to Razorpay",
+        "leave_id": leave_id,
+        "status": "approved",
+        "razorpay_applied": leave.razorpay_applied or False,
+    }
+
+
+@router.patch("/{leave_id}/reject")
+def reject_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_db)):
+    """Reject a leave request."""
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+
+    employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    leave.status = "rejected"
+    leave.approved_by = approved_by
+    db.commit()
+    employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
+
+    approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
+    pm_name = approver.name if approver and approver.name else "your PM"
+
+    try_send_leave_status_message(
+        employee_email=employee.email,
+        employee_name=employee.name,
+        start_date=leave.start_date.isoformat(),
+        end_date=leave.end_date.isoformat(),
+        pm_name=pm_name,
+        approved=False,
+    )
+
+    return {"message": "Leave rejected", "leave_id": leave_id, "status": "rejected"}
+
+
+@router.delete("/{leave_id}")
+def delete_leave(leave_id: int, db: Session = Depends(get_db)):
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+    db.delete(leave)
+    db.commit()
+    return {"message": "Leave deleted successfully"}

@@ -1,0 +1,154 @@
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from typing import Dict, List
+from collections import defaultdict
+
+from app.db.database import get_db
+from app.models.employee import Employee
+from app.models.allocation import Allocation
+
+router_old = APIRouter(prefix="/skills", tags=["Skills"])
+
+
+@router_old.get("/summary")
+def get_skills_summary(db: Session = Depends(get_db)) -> Dict:
+    """
+    Get manpower summary by skill.
+    Returns total employees, allocated count, and available count per skill.
+    """
+    # Get all active employees
+    employees = db.query(Employee).filter(Employee.status == "active").all()
+    
+    # Get all allocations
+    allocations = db.query(Allocation).all()
+    allocated_employee_ids = {a.employee_id for a in allocations}
+    
+    # Build skill summary
+    skill_summary = defaultdict(lambda: {"total": 0, "allocated": 0, "available": 0, "employees": []})
+    
+    for emp in employees:
+        if emp.skills:
+            for skill in emp.skills:
+                skill_lower = skill.lower().strip()
+                skill_summary[skill_lower]["total"] += 1
+                skill_summary[skill_lower]["employees"].append({
+                    "id": emp.id,
+                    "name": emp.name,
+                    "allocated": emp.id in allocated_employee_ids
+                })
+                
+                if emp.id in allocated_employee_ids:
+                    skill_summary[skill_lower]["allocated"] += 1
+                else:
+                    skill_summary[skill_lower]["available"] += 1
+    
+    return {
+        "skills": dict(skill_summary),
+        "total_active_employees": len(employees),
+        "total_allocated": len(allocated_employee_ids),
+        "total_available": len(employees) - len([e for e in employees if e.id in allocated_employee_ids])
+    }
+
+
+
+# @router.get("/{skill}/employees")
+# def get_employees_by_skill(skill: str, db: Session = Depends(get_db)) -> List[Dict]:
+#     """
+#     Get all employees with a specific skill.
+#     """
+#     employees = db.query(Employee).filter(Employee.status == "active").all()
+#     allocations = db.query(Allocation).all()
+#     allocated_employee_ids = {a.employee_id for a in allocations}
+    
+#     matching = []
+#     for emp in employees:
+#         if emp.skills:
+#             for emp_skill in emp.skills:
+#                 if skill.lower() in emp_skill.lower():
+#                     matching.append({
+#                         "id": emp.id,
+#                         "name": emp.name,
+#                         "email": emp.email,
+#                         "skills": emp.skills,
+#                         "allocated": emp.id in allocated_employee_ids,
+#                         "weekly_availability": emp.weekly_availability
+#                     })
+#                     break
+    
+#     return matching
+
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+
+from app.db.database import get_db
+from app.schemas.skill import Skill, SkillCreate
+from app.services import skill as skill_crud
+from app.seed_skills import ALLOWED_SKILLS, seed_skills
+
+router = APIRouter(prefix="/api/skills", tags=["skills"])
+
+
+@router.get("", response_model=List[Skill])
+def get_skills(db: Session = Depends(get_db)):
+    """Get all skills"""
+    # Self-heal and prune the catalog to the approved dropdown values.
+    seed_skills()
+    skills = skill_crud.get_all_skills(db)
+    return [skill for skill in skills if skill.name in ALLOWED_SKILLS]
+
+
+@router.get("/summary")
+def get_skills_summary(db: Session = Depends(get_db)):
+    """Get manpower summary by skill"""
+    from collections import defaultdict
+    from app.models.employee import Employee
+    from app.models.allocation import Allocation
+    
+    employees = db.query(Employee).filter(Employee.status == "active").all()
+    allocations = db.query(Allocation).all()
+    allocated_employee_ids = {a.employee_id for a in allocations}
+    
+    skill_summary = defaultdict(lambda: {"total": 0, "allocated": 0, "available": 0})
+    
+    for emp in employees:
+        if emp.skills:
+            for skill in emp.skills:
+                skill_lower = skill.lower().strip()
+                skill_summary[skill_lower]["total"] += 1
+                
+                if emp.id in allocated_employee_ids:
+                    skill_summary[skill_lower]["allocated"] += 1
+                else:
+                    skill_summary[skill_lower]["available"] += 1
+    
+    return {
+        "skills": dict(skill_summary),
+        "total_active_employees": len(employees),
+        "total_allocated": len(allocated_employee_ids),
+        "total_available": len(employees) - len([e for e in employees if e.id in allocated_employee_ids])
+    }
+
+
+@router.post("", response_model=Skill)
+def create_skill(skill: SkillCreate, db: Session = Depends(get_db)):
+    """Create a new skill"""
+    if skill.name not in ALLOWED_SKILLS:
+        raise HTTPException(status_code=400, detail="Only approved skills are allowed")
+
+    # Check if skill already exists
+    existing_skill = skill_crud.get_skill_by_name(db, skill.name)
+    if existing_skill:
+        raise HTTPException(status_code=400, detail="Skill already exists")
+    
+    return skill_crud.create_skill(db, skill)
+
+
+@router.delete("/{skill_id}")
+def delete_skill(skill_id: int, db: Session = Depends(get_db)):
+    """Delete a skill"""
+    skill = skill_crud.delete_skill(db, skill_id)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+    return {"message": "Skill deleted"}
