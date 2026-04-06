@@ -7,7 +7,11 @@ DesignationType = Literal["Program Manager", "Annotator", "Developer", "QA", "Re
 VALID_EMPLOYEE_TYPES = {"Full-time", "Part-time", "Intern", "Contract"}
 EMPLOYEE_TYPE_ALIASES = {
     "Full-Time": "Full-time",
+    "Full Time": "Full-time",
     "Part-Time": "Part-time",
+    "Part Time": "Part-time",
+    "Contract Based": "Contract",
+    "Contract based": "Contract",
 }
 
 

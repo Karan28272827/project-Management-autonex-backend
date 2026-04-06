@@ -97,16 +97,14 @@ def create_parent_project(
     db: Session = Depends(get_db)
 ):
     """Create a new parent project."""
-    # Validate program manager exists if provided
-    if parent_project.program_manager_id:
-        pm = db.query(Employee).filter(Employee.id == parent_project.program_manager_id).first()
+    # Validate program manager exists if provided; silently clear if not found
+    data = parent_project.model_dump()
+    if data.get("program_manager_id"):
+        pm = db.query(Employee).filter(Employee.id == data["program_manager_id"]).first()
         if not pm:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Employee with ID {parent_project.program_manager_id} not found"
-            )
-    
-    db_parent_project = ParentProject(**parent_project.model_dump())
+            data["program_manager_id"] = None
+
+    db_parent_project = ParentProject(**data)
     db.add(db_parent_project)
     db.commit()
     db.refresh(db_parent_project)
@@ -186,14 +184,11 @@ def update_parent_project(
             detail=f"Parent project with ID {parent_project_id} not found"
         )
     
-    # Validate program manager if being updated
+    # Validate program manager if being updated; silently clear if not found
     if update_data.program_manager_id:
         pm = db.query(Employee).filter(Employee.id == update_data.program_manager_id).first()
         if not pm:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Employee with ID {update_data.program_manager_id} not found"
-            )
+            update_data.program_manager_id = None
     
     # Update only provided fields
     update_dict = update_data.model_dump(exclude_unset=True)

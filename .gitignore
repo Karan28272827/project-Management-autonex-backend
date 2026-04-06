@@ -43,3 +43,19 @@ pip-wheel-metadata/
 .DS_Store
 Thumbs.db
 .venv
+.vercel
+
+# One-off utility / seed scripts
+import_employees_to_users.py
+seed_admin.py
+sync_excel_full.py
+sync_roles_to_tables.py
+
+# Unused model stubs
+app/models/admin.py
+app/models/product_manager.py
+
+# Local test scripts
+test_auth_e2e.py
+test_leaves_e2e.py
+test_slack_trial.py

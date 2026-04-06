@@ -1,6 +1,7 @@
 """
-Authentication API: signup, login, logout, me.
+Authentication API: signup, login, logout, forgot-password, reset-password, me.
 """
+import logging
 import os
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -23,7 +24,9 @@ from app.services.auth_service import (
     is_token_blacklisted,
     get_current_user,
 )
-from app.services.slack_service import send_slack_reset_link
+from app.services.email_service import send_password_reset_email
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -71,6 +74,9 @@ class LoginResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     message: str
+    # Only populated in dev mode (DEV_RETURN_RESET_TOKEN=true) — never expose in production
+    reset_token: Optional[str] = None
+    reset_link: Optional[str] = None
 
 
 DESIGNATION_ACCESS = {
@@ -121,7 +127,12 @@ def get_frontend_base_url(request: Request) -> str:
         or os.getenv("FRONTEND_URL")
         or request.headers.get("origin")
         or "http://localhost:5173"
-    ).rstrip("/")
+    ).strip().rstrip("/")
+
+
+def _dev_mode() -> bool:
+    """Return True when DEV_RETURN_RESET_TOKEN=true — exposes reset token in API response."""
+    return os.getenv("DEV_RETURN_RESET_TOKEN", "false").lower() == "true"
 
 
 # ── Endpoints ───────────────────────────────────────────────────────
@@ -129,16 +140,16 @@ def get_frontend_base_url(request: Request) -> str:
 @router.post("/signup", response_model=LoginResponse, status_code=status.HTTP_201_CREATED)
 def signup(body: SignupRequest, db: Session = Depends(get_db)):
     """Register a new user. Defaults to 'employee' role."""
+    logger.info("[signup] Attempt: email=%s role=%s", body.email, body.role)
 
-    # Check duplicate email
     existing = db.query(User).filter(User.email == body.email).first()
     if existing:
+        logger.warning("[signup] Duplicate email: %s", body.email)
         raise HTTPException(status_code=400, detail="Email already registered")
 
     # Only allow 'employee' or 'pm' via signup; admin is seed-only
     role = body.role if body.role in ("employee", "pm") else "employee"
 
-    # Create matching Employee record so they appear in the team
     employee = Employee(
         name=body.name,
         email=body.email,
@@ -148,7 +159,7 @@ def signup(body: SignupRequest, db: Session = Depends(get_db)):
         status="active",
     )
     db.add(employee)
-    db.flush()  # get employee.id
+    db.flush()
 
     user = User(
         name=body.name,
@@ -162,6 +173,7 @@ def signup(body: SignupRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
+    logger.info("[signup] Created user id=%s email=%s role=%s", user.id, user.email, role)
     response_user = build_user_response(user, db)
     token = create_access_token({
         "sub": str(user.id),
@@ -176,16 +188,32 @@ def signup(body: SignupRequest, db: Session = Depends(get_db)):
 @router.post("/login", response_model=LoginResponse)
 def login(body: LoginRequest, db: Session = Depends(get_db)):
     """Authenticate with email + password, returns JWT."""
+    logger.info("[login] Attempt: email=%s portal=%s", body.email, body.portal)
 
     user = db.query(User).filter(User.email == body.email).first()
-    if not user or not verify_password(body.password, user.password_hash):
+    if not user:
+        logger.warning("[login] User not found: %s", body.email)
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    logger.debug("[login] User found: id=%s is_active=%s role=%s", user.id, user.is_active, user.role)
+
+    password_ok = verify_password(body.password, user.password_hash)
+    logger.debug("[login] bcrypt.verify result: %s for user id=%s", password_ok, user.id)
+
+    if not password_ok:
+        logger.warning("[login] Wrong password for email=%s", body.email)
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not user.is_active:
+        logger.warning("[login] Deactivated account: email=%s", body.email)
         raise HTTPException(status_code=403, detail="Account is deactivated")
 
     response_user = build_user_response(user, db)
     if body.portal and response_user.role != body.portal:
+        logger.warning(
+            "[login] Portal mismatch: email=%s role=%s requested_portal=%s",
+            body.email, response_user.role, body.portal,
+        )
         raise HTTPException(
             status_code=403,
             detail=f"Access denied. This account must sign in through the {response_user.role} portal.",
@@ -198,43 +226,71 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         "employee_id": user.employee_id,
     })
 
+    logger.info("[login] Success: email=%s role=%s", body.email, response_user.role)
     return LoginResponse(token=token, user=response_user)
 
 
 @router.post("/forgot-password", response_model=MessageResponse)
-async def forgot_password(body: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)):
+def forgot_password(body: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)):
+    """
+    Request a password reset link.
+
+    Production:  Sends email via SMTP. Requires SMTP_HOST / SMTP_USER / SMTP_PASSWORD.
+    Dev/testing: Set DEV_RETURN_RESET_TOKEN=true to skip email and return the token directly.
+    """
     generic_message = "If an account exists for that email, reset instructions have been sent."
+    logger.info("[forgot-password] Request for email=%s", body.email)
+
     user = db.query(User).filter(User.email == body.email).first()
-
     if not user or not user.is_active:
+        logger.warning("[forgot-password] Email not found or inactive: %s", body.email)
+        # Always return the same message to prevent user enumeration
         return MessageResponse(message=generic_message)
 
-    employee = None
-    if user.employee_id:
-        employee = db.query(Employee).filter(Employee.id == user.employee_id).first()
-    if employee is None:
-        employee = db.query(Employee).filter(Employee.email == user.email).first()
-
-    slack_user_id = getattr(employee, "slack_user_id", None)
-    if not slack_user_id:
-        return MessageResponse(message=generic_message)
-
+    logger.debug("[forgot-password] Generating reset token for user id=%s", user.id)
     reset_token, expires_at = create_password_reset_token(user.id)
-    user.password_reset_token_hash = hash_reset_token(reset_token)
+    token_hash = hash_reset_token(reset_token)
+    logger.debug("[forgot-password] Token hash (sha256): %s...  expires_at=%s", token_hash[:12], expires_at)
+
+    user.password_reset_token_hash = token_hash
     user.password_reset_expires_at = expires_at
     db.add(user)
     db.commit()
 
-    reset_link = f"{get_frontend_base_url(request)}/reset-password?token={reset_token}&role={get_access_role(get_user_designation(user, db), user.role)}"
+    reset_link = (
+        f"{get_frontend_base_url(request)}/reset-password"
+        f"?token={reset_token}"
+        f"&role={get_access_role(get_user_designation(user, db), user.role)}"
+    )
 
+    # ── Dev mode: skip email and return token directly ──────────────
+    if _dev_mode():
+        logger.warning(
+            "[forgot-password] DEV_RETURN_RESET_TOKEN=true — returning token in response. "
+            "NEVER enable this in production!"
+        )
+        return MessageResponse(
+            message="[DEV MODE] Reset token generated. Use reset_token or reset_link below.",
+            reset_token=reset_token,
+            reset_link=reset_link,
+        )
+
+    # ── Production: send email ──────────────────────────────────────
     try:
-        await send_slack_reset_link(slack_user_id, reset_link)
+        logger.info("[forgot-password] Sending reset email to %s", user.email)
+        send_password_reset_email(to_email=user.email, to_name=user.name, reset_link=reset_link)
+        logger.info("[forgot-password] Email sent to %s", user.email)
     except Exception as exc:
+        logger.error("[forgot-password] Email send failed for %s: %s", user.email, exc)
+        # Roll back token so user can retry
         user.password_reset_token_hash = None
         user.password_reset_expires_at = None
         db.add(user)
         db.commit()
-        raise HTTPException(status_code=503, detail="Password reset Slack delivery is unavailable") from exc
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to send reset email. Please try again later.",
+        ) from exc
 
     return MessageResponse(message=generic_message)
 
@@ -245,17 +301,28 @@ def reset_password(
     token: str = Query(..., min_length=1),
     db: Session = Depends(get_db),
 ):
+    """
+    Reset password using a token from forgot-password.
+    Pass the token as a query parameter: POST /api/auth/reset-password?token=<token>
+    Body: { "password": "<new_password>" }
+    """
+    logger.info("[reset-password] Attempt with token (first 12 chars): %s...", token[:12])
+
     if len(body.password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters long")
 
+    # Decode and validate JWT
     try:
         payload = decode_token(token)
     except ExpiredSignatureError:
+        logger.warning("[reset-password] Token expired")
         raise HTTPException(status_code=400, detail="Reset link has expired")
-    except JWTError:
+    except JWTError as exc:
+        logger.warning("[reset-password] Invalid JWT: %s", exc)
         raise HTTPException(status_code=400, detail="Invalid or expired reset link")
 
     if payload.get("purpose") != "password_reset":
+        logger.warning("[reset-password] Wrong token purpose: %s", payload.get("purpose"))
         raise HTTPException(status_code=400, detail="Invalid reset link")
 
     try:
@@ -263,29 +330,44 @@ def reset_password(
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Invalid reset link")
 
+    # Look up user
     user = db.query(User).filter(User.id == user_id).first()
+    logger.debug("[reset-password] User lookup: id=%s found=%s", user_id, user is not None)
     if not user or not user.is_active:
         raise HTTPException(status_code=400, detail="Invalid reset link")
 
+    # Verify stored token hash
     if not user.password_reset_token_hash or not user.password_reset_expires_at:
+        logger.warning("[reset-password] No pending reset token for user id=%s", user_id)
         raise HTTPException(status_code=400, detail="Invalid reset link")
 
-    if user.password_reset_token_hash != hash_reset_token(token):
+    incoming_hash = hash_reset_token(token)
+    logger.debug(
+        "[reset-password] Hash comparison: incoming=%s... stored=%s...",
+        incoming_hash[:12], user.password_reset_token_hash[:12],
+    )
+    if user.password_reset_token_hash != incoming_hash:
+        logger.warning("[reset-password] Token hash mismatch for user id=%s", user_id)
         raise HTTPException(status_code=400, detail="Invalid reset link")
 
+    # Secondary expiry check (belt-and-suspenders alongside JWT exp)
     if user.password_reset_expires_at < datetime.utcnow():
+        logger.warning("[reset-password] Token expired (DB check) for user id=%s", user_id)
         user.password_reset_token_hash = None
         user.password_reset_expires_at = None
         db.add(user)
         db.commit()
         raise HTTPException(status_code=400, detail="Reset link has expired")
 
+    # Hash and store new password
+    logger.info("[reset-password] Hashing and storing new password for user id=%s", user_id)
     user.password_hash = hash_password(body.password)
     user.password_reset_token_hash = None
     user.password_reset_expires_at = None
     db.add(user)
     db.commit()
 
+    logger.info("[reset-password] Password reset successful for user id=%s email=%s", user_id, user.email)
     return MessageResponse(message="Password reset successful. You can now sign in with your new password.")
 
 
@@ -294,7 +376,9 @@ def logout(request: Request):
     """Invalidate current token."""
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
-        blacklist_token(auth_header[7:])
+        token = auth_header[7:]
+        blacklist_token(token)
+        logger.info("[logout] Token blacklisted")
     return {"message": "Logged out successfully"}
 
 

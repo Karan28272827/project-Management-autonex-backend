@@ -1,9 +1,10 @@
+import os
 from pathlib import Path
 
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +19,7 @@ from app.api.recommendations import router as recommendations_router
 from app.api.sub_projects import router as sub_projects_router
 from app.api.guidelines import router as guidelines_router
 from app.api.side_projects_api import router as side_projects_api_router
+from app.api.notifications import router as notifications_router
 from app.seed_skills import seed_skills
 
 Base.metadata.create_all(bind=engine)
@@ -195,7 +197,10 @@ seed_skills()
 
 app = FastAPI(title="Autonex Resource Planning Tool V2")
 
-uploads_dir = Path(__file__).resolve().parents[1] / "uploads"
+if os.environ.get("VERCEL"):
+    uploads_dir = Path("/tmp/uploads")
+else:
+    uploads_dir = Path(__file__).resolve().parents[1] / "uploads"
 uploads_dir.mkdir(parents=True, exist_ok=True)
 
 # Configure CORS
@@ -218,4 +223,5 @@ app.include_router(recommendations_router)
 app.include_router(sub_projects_router)
 app.include_router(guidelines_router)
 app.include_router(side_projects_api_router)
+app.include_router(notifications_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")

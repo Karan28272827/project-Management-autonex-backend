@@ -17,6 +17,7 @@ from app.models.parent_project import MainProject
 from app.models.project import DailySheet
 from app.models.sub_project import SubProject
 from app.models.user import User
+from app.models.notification import Notification
 from app.schemas.leave import Leave as LeaveSchema, LeaveCreate
 from app.services.slack_service import (
     get_or_cache_employee_slack_user_id,
@@ -29,14 +30,21 @@ from app.services.slack_service import (
 router = APIRouter(prefix="/api/leaves", tags=["Leaves"])
 
 
+def _push_notification(db: Session, user_id: int, title: str, message: str, notif_type: str) -> None:
+    """Persist an in-app notification for the given user."""
+    n = Notification(user_id=user_id, title=title, message=message, type=notif_type)
+    db.add(n)
+    # Caller is responsible for committing
+
+
 def get_razorpay_leave_type(local_leave_type: str) -> int:
     normalized = normalize_leave_type(local_leave_type)
     return RAZORPAY_LEAVE_TYPE_IDS.get(normalized, 0)
 
 
 def post_razorpay_attendance(request_body: dict) -> str:
-    razorpay_api_id = os.getenv("RAZORPAY_API_ID")
-    razorpay_api_key = os.getenv("RAZORPAY_API_KEY")
+    razorpay_api_id = (os.getenv("RAZORPAY_API_ID") or "").strip()
+    razorpay_api_key = (os.getenv("RAZORPAY_API_KEY") or "").strip()
 
     if not razorpay_api_id or not razorpay_api_key:
         raise HTTPException(
@@ -58,12 +66,25 @@ def post_razorpay_attendance(request_body: dict) -> str:
 
     try:
         with urlopen(request, timeout=20) as response:
-            return response.read().decode("utf-8", errors="ignore")
+            body = response.read().decode("utf-8", errors="ignore")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore") or exc.reason
         raise HTTPException(status_code=502, detail=f"Razorpay leave sync failed: {detail}")
     except URLError as exc:
         raise HTTPException(status_code=502, detail=f"Razorpay leave sync failed: {exc.reason}")
+
+    # Razorpay returns HTTP 200 even for business-logic errors — check the body
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and "error" in parsed:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Razorpay leave sync failed: {parsed['error']}",
+            )
+    except (ValueError, KeyError):
+        pass  # non-JSON response is fine
+
+    return body
 
 
 def build_razorpay_attendance_request(employee: Employee, date_value, leave_type: str, remarks: str) -> dict:
@@ -188,6 +209,46 @@ def _get_pm_notification_targets(db: Session, employee: Employee, leave: Leave) 
     return notification_targets
 
 
+def _get_admin_notification_targets(db: Session) -> list[dict]:
+    """Return Slack-reachable admin users to use as fallback when no PM is assigned."""
+    from app.services.slack_service import lookup_user_id_by_email
+
+    admin_users = (
+        db.query(User)
+        .filter(User.role == "admin", User.is_active == True)
+        .all()
+    )
+    targets = []
+    for admin_user in admin_users:
+        # Prefer linked employee record for Slack lookup; fall back to user email
+        slack_user_id = None
+        admin_name = admin_user.name or admin_user.email
+
+        if admin_user.employee_id:
+            admin_employee = db.query(Employee).filter(Employee.id == admin_user.employee_id).first()
+            if admin_employee:
+                slack_user_id = try_get_or_cache_employee_slack_user_id(db, admin_employee)
+                admin_name = admin_employee.name or admin_name
+
+        if not slack_user_id:
+            try:
+                slack_user_id = lookup_user_id_by_email(admin_user.email)
+            except Exception:
+                pass
+
+        if not slack_user_id:
+            continue
+
+        targets.append(
+            {
+                "pm_employee": type("_Admin", (), {"name": admin_name, "id": None})(),
+                "pm_slack_user_id": slack_user_id,
+                "impacted_projects": ["No PM assigned — routed to Admin"],
+            }
+        )
+    return targets
+
+
 @router.get("", response_model=List[LeaveSchema])
 def get_all_leaves(
     employee_id: Optional[int] = None,
@@ -239,6 +300,23 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
+    # Reject if any existing leave (pending or approved) overlaps the requested range
+    overlap = (
+        db.query(Leave)
+        .filter(
+            Leave.employee_id == payload.employee_id,
+            Leave.status != "rejected",
+            Leave.start_date <= payload.end_date,
+            Leave.end_date >= payload.start_date,
+        )
+        .first()
+    )
+    if overlap:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}). Please check your existing leaves.",
+        )
+
     leave = Leave(
         employee_id=payload.employee_id,
         start_date=payload.start_date,
@@ -251,6 +329,17 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(leave)
 
+    # In-app notification: employee who applied
+    emp_user = db.query(User).filter(User.employee_id == employee.id).first()
+    if emp_user:
+        _push_notification(
+            db, emp_user.id,
+            "Leave request submitted",
+            f"Your {get_leave_type_label(leave.leave_type)} request ({leave.start_date} – {leave.end_date}) has been submitted and is pending approval.",
+            "leave_applied",
+        )
+        db.commit()
+
     employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
 
     try_send_leave_applied_message(
@@ -262,7 +351,10 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
     )
 
     duration_days = (leave.end_date - leave.start_date).days + 1
-    for target in _get_pm_notification_targets(db, employee, leave):
+    pm_targets = _get_pm_notification_targets(db, employee, leave)
+    notification_targets = pm_targets if pm_targets else _get_admin_notification_targets(db)
+    notified_user_ids: set[int] = set()
+    for target in notification_targets:
         try_send_pm_leave_request_message(
             pm_slack_user_id=target["pm_slack_user_id"],
             pm_name=target["pm_employee"].name,
@@ -276,6 +368,31 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
             reason=leave.reason,
             impacted_projects=target["impacted_projects"],
         )
+        # In-app notification for PM (real PM only — admin fallback handled below)
+        pm_emp_id = getattr(target["pm_employee"], "id", None)
+        if pm_emp_id:
+            pm_user = db.query(User).filter(User.employee_id == pm_emp_id).first()
+            if pm_user and pm_user.id not in notified_user_ids:
+                notified_user_ids.add(pm_user.id)
+                _push_notification(
+                    db, pm_user.id,
+                    f"New leave request from {employee.name}",
+                    f"{employee.name} has requested {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date}.",
+                    "leave_applied",
+                )
+
+    # Admin fallback: notify each admin exactly once (regardless of Slack-reachable count)
+    if not pm_targets:
+        for admin_user in db.query(User).filter(User.role == "admin", User.is_active == True).all():
+            if admin_user.id not in notified_user_ids:
+                notified_user_ids.add(admin_user.id)
+                _push_notification(
+                    db, admin_user.id,
+                    f"New leave request from {employee.name}",
+                    f"{employee.name} has requested {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date} (no PM assigned).",
+                    "leave_applied",
+                )
+    db.commit()
 
     return LeaveSchema(
         leave_id=leave.id,
@@ -349,17 +466,37 @@ def approve_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    if not leave.razorpay_applied:
-        sync_leave_to_razorpay(employee, leave)
-        leave.razorpay_applied = True
-
+    # Approve the leave first — always succeeds regardless of Razorpay
     leave.status = "approved"
     leave.approved_by = approved_by
+
+    # Attempt Razorpay sync; if it fails, leave razorpay_applied=False for later retry
+    sync_warning = None
+    if not leave.razorpay_applied:
+        try:
+            sync_leave_to_razorpay(employee, leave)
+            leave.razorpay_applied = True
+        except HTTPException as exc:
+            sync_warning = exc.detail
+        except Exception as exc:
+            sync_warning = str(exc)
+
     db.commit()
     employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
 
     approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
     pm_name = approver.name if approver and approver.name else "your PM"
+
+    # In-app notification: employee
+    emp_user = db.query(User).filter(User.employee_id == employee.id).first()
+    if emp_user:
+        _push_notification(
+            db, emp_user.id,
+            "Leave approved",
+            f"Your {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date} has been approved by {pm_name}.",
+            "leave_approved",
+        )
+        db.commit()
 
     try_send_leave_status_message(
         employee_email=employee.email,
@@ -370,12 +507,15 @@ def approve_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get
         approved=True,
     )
 
-    return {
-        "message": "Leave approved and synced to Razorpay",
+    result = {
+        "message": "Leave approved and synced to Razorpay" if leave.razorpay_applied else "Leave approved (Razorpay sync pending — use 'Apply to Razorpay' to retry)",
         "leave_id": leave_id,
         "status": "approved",
         "razorpay_applied": leave.razorpay_applied or False,
     }
+    if sync_warning:
+        result["sync_warning"] = sync_warning
+    return result
 
 
 @router.patch("/{leave_id}/reject")
@@ -396,6 +536,17 @@ def reject_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_
 
     approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
     pm_name = approver.name if approver and approver.name else "your PM"
+
+    # In-app notification: employee
+    emp_user = db.query(User).filter(User.employee_id == employee.id).first()
+    if emp_user:
+        _push_notification(
+            db, emp_user.id,
+            "Leave declined",
+            f"Your {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date} was declined by {pm_name}.",
+            "leave_rejected",
+        )
+        db.commit()
 
     try_send_leave_status_message(
         employee_email=employee.email,

@@ -16,7 +16,9 @@ from app.models.guideline import Guideline
 
 router = APIRouter(prefix="/api/guidelines", tags=["Guidelines"])
 
-UPLOAD_DIR = Path(__file__).resolve().parents[2] / "uploads" / "guidelines"
+import os
+_base = Path("/tmp/uploads") if os.environ.get("VERCEL") else Path(__file__).resolve().parents[2] / "uploads"
+UPLOAD_DIR = _base / "guidelines"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
