@@ -208,6 +208,26 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         logger.warning("[login] Deactivated account: email=%s", body.email)
         raise HTTPException(status_code=403, detail="Account is deactivated")
 
+    # Auto-link PM/employee users to an Employee record if not yet linked
+    if user.employee_id is None:
+        employee = db.query(Employee).filter(Employee.email == user.email).first()
+        if employee is None and user.role in ("pm", "employee"):
+            # Create a fresh Employee record for this user
+            employee = Employee(
+                name=user.name,
+                email=user.email,
+                employee_type="Full-time",
+                designation="Program Manager" if user.role == "pm" else "Annotator/ Reviewer",
+                status="active",
+            )
+            db.add(employee)
+            db.flush()
+        if employee is not None:
+            user.employee_id = employee.id
+            db.commit()
+            db.refresh(user)
+            logger.info("[login] Auto-linked user id=%s to employee id=%s", user.id, user.employee_id)
+
     response_user = build_user_response(user, db)
     if body.portal and response_user.role != body.portal:
         logger.warning(
