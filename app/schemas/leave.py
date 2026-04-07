@@ -35,5 +35,7 @@ class Leave(LeaveBase):
     status: Optional[str] = "pending"
     approved_by: Optional[int] = None
     razorpay_applied: Optional[bool] = False
+    flagged: Optional[bool] = False
+    approval_remark: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None

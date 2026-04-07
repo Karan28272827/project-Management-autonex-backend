@@ -1,0 +1,219 @@
+"""WFH (Work From Home) request management API."""
+import logging
+from datetime import date
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from app.db.database import get_db
+from app.models.wfh import WFHRequest
+from app.models.employee import Employee
+from app.models.user import User
+from app.models.notification import Notification
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/wfh", tags=["wfh"])
+
+
+# ── Schemas ──────────────────────────────────────────────────────────────────
+
+class WFHCreate(BaseModel):
+    employee_id: int
+    wfh_date: date
+    reason: Optional[str] = None
+
+
+class WFHResponse(BaseModel):
+    id: int
+    employee_id: int
+    wfh_date: date
+    reason: Optional[str] = None
+    status: str
+    approved_by: Optional[int] = None
+    remark: Optional[str] = None
+    employee_name: Optional[str] = None
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class WFHApproveBody(BaseModel):
+    remark: Optional[str] = None
+
+
+def _push_notification(db: Session, user_id: int, title: str, message: str, notif_type: str):
+    db.add(Notification(user_id=user_id, title=title, message=message, type=notif_type))
+
+
+def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
+    employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    return WFHResponse(
+        id=req.id,
+        employee_id=req.employee_id,
+        wfh_date=req.wfh_date,
+        reason=req.reason,
+        status=req.status,
+        approved_by=req.approved_by,
+        remark=req.remark,
+        employee_name=employee.name if employee else None,
+        created_at=req.created_at.isoformat() if req.created_at else None,
+    )
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.get("", response_model=List[WFHResponse])
+def get_wfh_requests(
+    employee_id: Optional[int] = Query(None),
+    month: Optional[str] = Query(None, description="YYYY-MM"),
+    db: Session = Depends(get_db),
+):
+    """Get WFH requests. Filter by employee_id and/or month (YYYY-MM)."""
+    q = db.query(WFHRequest)
+    if employee_id:
+        q = q.filter(WFHRequest.employee_id == employee_id)
+    if month:
+        try:
+            year, mo = int(month[:4]), int(month[5:7])
+            from datetime import date as dt
+            start = dt(year, mo, 1)
+            end_mo = mo + 1 if mo < 12 else 1
+            end_yr = year if mo < 12 else year + 1
+            end = dt(end_yr, end_mo, 1)
+            q = q.filter(WFHRequest.wfh_date >= start, WFHRequest.wfh_date < end)
+        except Exception:
+            pass
+    requests = q.order_by(WFHRequest.wfh_date.desc()).all()
+    emp_ids = list({r.employee_id for r in requests})
+    employees = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
+    result = []
+    for req in requests:
+        emp = employees.get(req.employee_id)
+        result.append(WFHResponse(
+            id=req.id,
+            employee_id=req.employee_id,
+            wfh_date=req.wfh_date,
+            reason=req.reason,
+            status=req.status,
+            approved_by=req.approved_by,
+            remark=req.remark,
+            employee_name=emp.name if emp else None,
+            created_at=req.created_at.isoformat() if req.created_at else None,
+        ))
+    return result
+
+
+@router.post("", response_model=WFHResponse, status_code=201)
+def create_wfh_request(payload: WFHCreate, db: Session = Depends(get_db)):
+    """Submit a WFH request."""
+    employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    # Check for duplicate WFH on same date
+    existing = db.query(WFHRequest).filter(
+        WFHRequest.employee_id == payload.employee_id,
+        WFHRequest.wfh_date == payload.wfh_date,
+        WFHRequest.status != "rejected",
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"A WFH request already exists for {payload.wfh_date}.")
+
+    req = WFHRequest(
+        employee_id=payload.employee_id,
+        wfh_date=payload.wfh_date,
+        reason=payload.reason,
+        status="pending",
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+
+    # Notify employee
+    emp_user = db.query(User).filter(User.employee_id == employee.id).first()
+    if emp_user:
+        _push_notification(db, emp_user.id, "WFH request submitted",
+            f"Your WFH request for {req.wfh_date} has been submitted and is pending approval.",
+            "wfh_applied")
+
+    # Notify admins
+    for admin in db.query(User).filter(User.role == "admin", User.is_active == True).all():
+        _push_notification(db, admin.id, f"WFH request from {employee.name}",
+            f"{employee.name} has requested WFH on {req.wfh_date}.",
+            "wfh_applied")
+    db.commit()
+
+    return _build_response(req, db)
+
+
+@router.patch("/{wfh_id}/approve")
+def approve_wfh(
+    wfh_id: int,
+    approved_by: int = Query(0),
+    body: WFHApproveBody = WFHApproveBody(),
+    db: Session = Depends(get_db),
+):
+    """Approve a WFH request."""
+    req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="WFH request not found")
+
+    employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
+    approver_name = approver.name if approver else "Admin"
+
+    req.status = "approved"
+    req.approved_by = approved_by
+    req.remark = body.remark
+    db.commit()
+
+    emp_user = db.query(User).filter(User.employee_id == req.employee_id).first()
+    if emp_user:
+        _push_notification(db, emp_user.id, "WFH approved",
+            f"Your WFH request for {req.wfh_date} has been approved by {approver_name}.",
+            "wfh_approved")
+        db.commit()
+
+    return {"message": "WFH request approved", "wfh_id": wfh_id, "status": "approved"}
+
+
+@router.patch("/{wfh_id}/reject")
+def reject_wfh(
+    wfh_id: int,
+    approved_by: int = Query(0),
+    body: WFHApproveBody = WFHApproveBody(),
+    db: Session = Depends(get_db),
+):
+    """Reject a WFH request."""
+    req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="WFH request not found")
+
+    approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
+    approver_name = approver.name if approver else "Admin"
+
+    req.status = "rejected"
+    req.approved_by = approved_by
+    req.remark = body.remark
+    db.commit()
+
+    emp_user = db.query(User).filter(User.employee_id == req.employee_id).first()
+    if emp_user:
+        _push_notification(db, emp_user.id, "WFH request declined",
+            f"Your WFH request for {req.wfh_date} was declined by {approver_name}.",
+            "wfh_rejected")
+        db.commit()
+
+    return {"message": "WFH request rejected", "wfh_id": wfh_id, "status": "rejected"}
+
+
+@router.delete("/{wfh_id}")
+def delete_wfh(wfh_id: int, db: Session = Depends(get_db)):
+    req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="WFH request not found")
+    db.delete(req)
+    db.commit()
+    return {"message": "WFH request deleted"}

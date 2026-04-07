@@ -14,6 +14,8 @@ class Leave(Base):
     status = Column(String, default="pending")  # pending, approved, rejected
     approved_by = Column(Integer, nullable=True)  # user_id of approver
     razorpay_applied = Column(Boolean, default=False)
+    flagged = Column(Boolean, default=False, nullable=False)
+    approval_remark = Column(Text, nullable=True)
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())

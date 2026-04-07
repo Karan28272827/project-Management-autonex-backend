@@ -59,3 +59,5 @@ app/models/product_manager.py
 test_auth_e2e.py
 test_leaves_e2e.py
 test_slack_trial.py
+.env*.local
+.env.production

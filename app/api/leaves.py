@@ -1,12 +1,13 @@
 import json
 import os
-from datetime import timedelta
+from datetime import timedelta, date as date_type
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from pydantic import BaseModel
 
 from app.db.database import get_db
 from app.constants.leave_types import RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type
@@ -258,7 +259,7 @@ def get_all_leaves(
     query = db.query(Leave)
     if employee_id:
         query = query.filter(Leave.employee_id == employee_id)
-    
+
     leaves = query.all()
     return [
         LeaveSchema(
@@ -271,9 +272,77 @@ def get_all_leaves(
             status=leave.status or "pending",
             approved_by=leave.approved_by,
             razorpay_applied=leave.razorpay_applied or False,
+            flagged=leave.flagged or False,
+            approval_remark=leave.approval_remark,
         )
         for leave in leaves
     ]
+
+
+@router.get("/calendar", response_model=dict)
+def get_calendar(
+    month: str = Query(..., description="YYYY-MM"),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns all leaves and WFH requests for a given month.
+    month: YYYY-MM format
+    """
+    from app.models.wfh import WFHRequest
+    try:
+        year, mo = int(month[:4]), int(month[5:7])
+        month_start = date_type(year, mo, 1)
+        end_mo = mo + 1 if mo < 12 else 1
+        end_yr = year if mo < 12 else year + 1
+        month_end = date_type(end_yr, end_mo, 1)
+    except Exception:
+        raise HTTPException(status_code=400, detail="month must be YYYY-MM format")
+
+    leaves = db.query(Leave).filter(
+        Leave.status != "rejected",
+        Leave.start_date < month_end,
+        Leave.end_date >= month_start,
+    ).all()
+
+    wfh_requests = db.query(WFHRequest).filter(
+        WFHRequest.status != "rejected",
+        WFHRequest.wfh_date >= month_start,
+        WFHRequest.wfh_date < month_end,
+    ).all()
+
+    emp_ids = list({l.employee_id for l in leaves} | {w.employee_id for w in wfh_requests})
+    employees = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
+
+    leave_events = []
+    for leave in leaves:
+        emp = employees.get(leave.employee_id)
+        leave_events.append({
+            "id": leave.id,
+            "type": "leave",
+            "leave_type": leave.leave_type,
+            "employee_id": leave.employee_id,
+            "employee_name": emp.name if emp else "Unknown",
+            "start_date": leave.start_date.isoformat(),
+            "end_date": leave.end_date.isoformat(),
+            "status": leave.status,
+            "reason": leave.reason,
+            "flagged": leave.flagged or False,
+        })
+
+    wfh_events = []
+    for wfh in wfh_requests:
+        emp = employees.get(wfh.employee_id)
+        wfh_events.append({
+            "id": wfh.id,
+            "type": "wfh",
+            "employee_id": wfh.employee_id,
+            "employee_name": emp.name if emp else "Unknown",
+            "date": wfh.wfh_date.isoformat(),
+            "status": wfh.status,
+            "reason": wfh.reason,
+        })
+
+    return {"month": month, "leaves": leave_events, "wfh": wfh_events}
 
 
 @router.get("/{leave_id}", response_model=LeaveSchema)
@@ -317,6 +386,27 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
             detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}). Please check your existing leaves.",
         )
 
+    # Monthly paid leave limit: max 2 paid leaves per calendar month
+    flagged = False
+    if payload.leave_type == "paid":
+        month_start = payload.start_date.replace(day=1)
+        end_mo = payload.start_date.month + 1 if payload.start_date.month < 12 else 1
+        end_yr = payload.start_date.year if payload.start_date.month < 12 else payload.start_date.year + 1
+        month_end = date_type(end_yr, end_mo, 1)
+        paid_this_month = (
+            db.query(Leave)
+            .filter(
+                Leave.employee_id == payload.employee_id,
+                Leave.leave_type == "paid",
+                Leave.status != "rejected",
+                Leave.start_date >= month_start,
+                Leave.start_date < month_end,
+            )
+            .count()
+        )
+        if paid_this_month >= 2:
+            flagged = True
+
     leave = Leave(
         employee_id=payload.employee_id,
         start_date=payload.start_date,
@@ -324,6 +414,7 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
         leave_type=payload.leave_type,
         reason=payload.reason,
         status="pending",
+        flagged=flagged,
     )
     db.add(leave)
     db.commit()
@@ -404,7 +495,13 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
         status=leave.status or "pending",
         approved_by=leave.approved_by,
         razorpay_applied=leave.razorpay_applied or False,
+        flagged=leave.flagged or False,
+        approval_remark=leave.approval_remark,
     )
+
+
+class ApproveBody(BaseModel):
+    remark: Optional[str] = None
 
 
 @router.post("/{leave_id}/apply-to-razorpay")
@@ -450,17 +547,31 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
         status=leave.status or "pending",
         approved_by=leave.approved_by,
         razorpay_applied=leave.razorpay_applied or False,
+        flagged=leave.flagged or False,
+        approval_remark=leave.approval_remark,
     )
 
 
 # ── Approve / Reject ───────────────────────────────────────────────
 
 @router.patch("/{leave_id}/approve")
-def approve_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_db)):
-    """Approve a leave request. Pass approved_by as query param (user_id)."""
+def approve_leave(
+    leave_id: int,
+    approved_by: int = Query(default=0),
+    body: ApproveBody = Body(default=ApproveBody()),
+    db: Session = Depends(get_db),
+):
+    """Approve a leave request. Pass approved_by as query param (user_id).
+    Flagged leaves (exceeding monthly limit) require a remark in the request body."""
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
+
+    if leave.flagged and not (body.remark and body.remark.strip()):
+        raise HTTPException(
+            status_code=422,
+            detail="This leave exceeds the monthly paid leave limit (2/month). A justification remark is required to approve it.",
+        )
 
     employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
     if not employee:
@@ -469,6 +580,8 @@ def approve_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get
     # Approve the leave first — always succeeds regardless of Razorpay
     leave.status = "approved"
     leave.approved_by = approved_by
+    if body.remark:
+        leave.approval_remark = body.remark.strip()
 
     # Attempt Razorpay sync; if it fails, leave razorpay_applied=False for later retry
     sync_warning = None
