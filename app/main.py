@@ -4,7 +4,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +21,7 @@ from app.api.guidelines import router as guidelines_router
 from app.api.side_projects_api import router as side_projects_api_router
 from app.api.notifications import router as notifications_router
 from app.api.wfh import router as wfh_router
+from app.api.signup_requests import router as signup_requests_router
 from app.seed_skills import seed_skills
 
 Base.metadata.create_all(bind=engine)
@@ -226,4 +227,5 @@ app.include_router(guidelines_router)
 app.include_router(side_projects_api_router)
 app.include_router(notifications_router)
 app.include_router(wfh_router)
+app.include_router(signup_requests_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")

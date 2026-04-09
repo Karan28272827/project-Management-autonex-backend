@@ -107,6 +107,123 @@ def send_password_reset_email(*, to_email: str, to_name: str, reset_link: str) -
     )
 
 
+def send_signup_approved_email(*, to_email: str, to_name: str, temp_password: str, portal_url: str) -> None:
+    first = to_name.split()[0]
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 0; }}
+    .container {{ max-width: 600px; margin: 40px auto; background: #fff; border-radius: 10px;
+                  overflow: hidden; box-shadow: 0 2px 12px rgba(0,0,0,0.1); }}
+    .header {{ background: linear-gradient(135deg, #1a3fa8, #2b67ff); padding: 36px 40px; text-align: center; }}
+    .header h1 {{ color: #fff; margin: 0; font-size: 22px; }}
+    .header p {{ color: rgba(255,255,255,0.8); margin: 8px 0 0; font-size: 14px; }}
+    .body {{ padding: 36px 40px; }}
+    h2 {{ color: #1a1a2e; font-size: 17px; margin-top: 0; }}
+    p {{ color: #374151; line-height: 1.7; font-size: 15px; }}
+    .creds {{ background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px 24px; margin: 20px 0; }}
+    .creds table {{ width: 100%; border-collapse: collapse; }}
+    .creds td {{ padding: 8px 0; font-size: 14px; color: #374151; vertical-align: top; }}
+    .creds td:first-child {{ font-weight: 600; color: #1e293b; width: 160px; }}
+    .creds a {{ color: #2b67ff; text-decoration: none; }}
+    .creds code {{ background: #e0e7ff; color: #3730a3; padding: 3px 8px; border-radius: 4px; font-family: monospace; font-size: 14px; }}
+    .btn {{ display: inline-block; margin-top: 4px; background: #4f46e5; color: #fff !important;
+            text-decoration: none; padding: 12px 28px; border-radius: 6px; font-size: 15px; font-weight: 600; }}
+    .warning {{ background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px;
+                padding: 14px 18px; margin: 20px 0; font-size: 14px; color: #92400e; }}
+    .footer {{ background: #f8fafc; border-top: 1px solid #e5e7eb; padding: 20px 40px;
+               font-size: 12px; color: #9ca3af; text-align: center; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🎉 Welcome to Autonex AI!</h1>
+      <p>Your account has been approved</p>
+    </div>
+    <div class="body">
+      <p>Hi {first},</p>
+      <p>Great news! Your signup request has been <strong>approved</strong>.
+         Your employee account is now active. Use the credentials below to sign in.</p>
+      <div class="creds">
+        <table>
+          <tr><td>Portal</td><td><a href="{portal_url}">{portal_url}</a></td></tr>
+          <tr><td>Email</td><td>{to_email}</td></tr>
+          <tr><td>Temp Password</td><td><code>{temp_password}</code></td></tr>
+        </table>
+      </div>
+      <div class="warning">
+        ⚠️ <strong>Action Required:</strong> Please reset your password immediately after first login.
+      </div>
+      <a href="{portal_url}" class="btn">Sign In Now</a>
+      <p style="font-size:13px;color:#6b7280;margin-top:14px;">
+        Reset password: <a href="https://autonex-frontend.vercel.app/forgot-password" style="color:#2b67ff;">
+        autonex-frontend.vercel.app/forgot-password</a>
+      </p>
+      <p>If you have any questions, reach out in <strong>#autonex-tool-support</strong> on Slack.</p>
+      <p>Best regards,<br><strong>The Autonex AI Team</strong></p>
+    </div>
+    <div class="footer"><p>Autonex AI &mdash; {os.getenv("MAIL_FROM", "")}</p></div>
+  </div>
+</body>
+</html>"""
+    _send(to_email=to_email, to_name=to_name, subject="Your Autonex AI account is approved! 🎉", html_body=html)
+
+
+def send_signup_rejected_email(*, to_email: str, to_name: str, reason: str = "") -> None:
+    first = to_name.split()[0]
+    reason_block = f"<p><strong>Reason:</strong> {reason}</p>" if reason else ""
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 0; }}
+    .container {{ max-width: 560px; margin: 40px auto; background: #fff; border-radius: 8px;
+                  padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h2 {{ color: #1a1a2e; margin-top: 0; }}
+    p {{ color: #374151; line-height: 1.6; }}
+    .footer {{ margin-top: 32px; font-size: 12px; color: #9ca3af;
+               border-top: 1px solid #e5e7eb; padding-top: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Signup Request Update</h2>
+    <p>Hi {first},</p>
+    <p>We reviewed your signup request for Autonex AI and unfortunately we are unable to
+       approve it at this time.</p>
+    {reason_block}
+    <p>If you believe this is a mistake or have questions, please contact your manager
+       or reach out via <strong>#autonex-tool-support</strong>.</p>
+    <p>Best regards,<br><strong>The Autonex AI Team</strong></p>
+    <div class="footer"><p>Autonex AI &mdash; {os.getenv("MAIL_FROM", "")}</p></div>
+  </div>
+</body>
+</html>"""
+    _send(to_email=to_email, to_name=to_name, subject="Update on your Autonex AI signup request", html_body=html)
+
+
+def try_send_signup_approved_email(**kwargs) -> bool:
+    try:
+        send_signup_approved_email(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] Signup approved email failed: %s", exc)
+        return False
+
+
+def try_send_signup_rejected_email(**kwargs) -> bool:
+    try:
+        send_signup_rejected_email(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] Signup rejected email failed: %s", exc)
+        return False
+
+
 def try_send_password_reset_email(*, to_email: str, to_name: str, reset_link: str) -> bool:
     """Returns True on success, False on failure (logs the error)."""
     try:
