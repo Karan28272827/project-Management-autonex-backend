@@ -232,3 +232,113 @@ def try_send_password_reset_email(*, to_email: str, to_name: str, reset_link: st
     except Exception as exc:
         logger.warning("[email] Password reset email failed for %s: %s", to_email, exc)
         return False
+
+
+# ── Referral emails ───────────────────────────────────────────────────────────
+
+def send_referral_confirmation_email(
+    *, referrer_name: str, referrer_email: str, candidate_name: str, position: str
+) -> None:
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 0; }}
+    .container {{ max-width: 560px; margin: 40px auto; background: #fff; border-radius: 8px;
+                  padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h2 {{ color: #1a1a2e; margin-top: 0; }}
+    .badge {{ display: inline-block; background: #d1fae5; color: #065f46;
+              border-radius: 20px; padding: 4px 14px; font-size: 13px; font-weight: 600; margin-bottom: 20px; }}
+    p {{ color: #374151; line-height: 1.6; }}
+    .detail {{ background: #f9fafb; border-left: 4px solid #10b981; border-radius: 4px;
+               padding: 14px 18px; margin: 20px 0; }}
+    .detail strong {{ color: #065f46; }}
+    .footer {{ font-size: 12px; color: #9ca3af; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <span class="badge">Referral Submitted</span>
+    <h2>Thanks for your referral, {referrer_name}!</h2>
+    <p>We've received your referral and our hiring team will review it shortly.</p>
+    <div class="detail">
+      <p><strong>Candidate:</strong> {candidate_name}</p>
+      <p><strong>Position:</strong> {position}</p>
+    </div>
+    <p>We'll keep you updated as the application progresses. You can track the status in your
+       <strong>Autonex Employee Portal → Referrals</strong> page.</p>
+    <p>Best regards,<br><strong>The Autonex Hiring Team</strong></p>
+    <div class="footer"><p>Autonex AI &mdash; {os.getenv("MAIL_FROM", "")}</p></div>
+  </div>
+</body>
+</html>"""
+    _send(
+        to_email=referrer_email,
+        to_name=referrer_name,
+        subject=f"Referral received: {candidate_name} for {position}",
+        html_body=html,
+    )
+
+
+def send_referral_status_update_email(
+    *, referrer_name: str, referrer_email: str, candidate_name: str, position: str, new_status: str
+) -> None:
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 0; }}
+    .container {{ max-width: 560px; margin: 40px auto; background: #fff; border-radius: 8px;
+                  padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h2 {{ color: #1a1a2e; margin-top: 0; }}
+    .badge {{ display: inline-block; background: #eff6ff; color: #1d4ed8;
+              border-radius: 20px; padding: 4px 14px; font-size: 13px; font-weight: 600; margin-bottom: 20px; }}
+    p {{ color: #374151; line-height: 1.6; }}
+    .detail {{ background: #f9fafb; border-left: 4px solid #3b82f6; border-radius: 4px;
+               padding: 14px 18px; margin: 20px 0; }}
+    .status {{ font-size: 15px; font-weight: 700; color: #1d4ed8; }}
+    .footer {{ font-size: 12px; color: #9ca3af; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <span class="badge">Referral Update</span>
+    <h2>An update on your referral</h2>
+    <p>Hi {referrer_name}, here's the latest on the candidate you referred:</p>
+    <div class="detail">
+      <p><strong>Candidate:</strong> {candidate_name}</p>
+      <p><strong>Position:</strong> {position}</p>
+      <p>New status: <span class="status">{new_status}</span></p>
+    </div>
+    <p>You can view full details in your <strong>Autonex Employee Portal → Referrals</strong> page.</p>
+    <p>Best regards,<br><strong>The Autonex Hiring Team</strong></p>
+    <div class="footer"><p>Autonex AI &mdash; {os.getenv("MAIL_FROM", "")}</p></div>
+  </div>
+</body>
+</html>"""
+    _send(
+        to_email=referrer_email,
+        to_name=referrer_name,
+        subject=f"Referral update: {candidate_name} — {new_status}",
+        html_body=html,
+    )
+
+
+def try_send_referral_confirmation_email(**kwargs) -> bool:
+    try:
+        send_referral_confirmation_email(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] Referral confirmation email failed: %s", exc)
+        return False
+
+
+def try_send_referral_status_update_email(**kwargs) -> bool:
+    try:
+        send_referral_status_update_email(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] Referral status update email failed: %s", exc)
+        return False
