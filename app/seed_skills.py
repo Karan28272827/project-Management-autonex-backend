@@ -4,11 +4,14 @@ from app.services import skill as skill_crud
 
 
 ALLOWED_SKILLS = [
+    "Yutori Verifier",
     "Yutori Annotation",
     "Robotics Annotation",
-    "Robotics Data Collection",
-    "Smart Manufacturing",
     "Development",
+    "Robotics Data Collection",
+    "Data Labeling",
+    "Quality Review",
+    "Smart Factory Development",
 ]
 
 
