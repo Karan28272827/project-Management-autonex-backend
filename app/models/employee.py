@@ -27,7 +27,10 @@ class Employee(Base):
     slack_user_id = Column(String(64), nullable=True)
     
     productivity_baseline = Column(Float, nullable=False, default=1.0)
-    
+
+    # Monthly base salary (CTC) — used for payroll calculation
+    base_salary = Column(Float, nullable=True)
+
     status = Column(Text, default="active")  # active, inactive, on-leave
     
     created_at = Column(TIMESTAMP, server_default=func.now())

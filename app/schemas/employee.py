@@ -41,6 +41,7 @@ class EmployeeBase(BaseModel):
     skills: Optional[List[str]] = []
     productivity_baseline: float = Field(1.0, gt=0, le=2.0)
     status: Optional[str] = "active"
+    base_salary: Optional[float] = None
 
     @field_validator("employee_type", mode="before")
     @classmethod
@@ -67,6 +68,7 @@ class EmployeeUpdate(BaseModel):
     skills: Optional[List[str]] = None
     productivity_baseline: Optional[float] = None
     status: Optional[str] = None
+    base_salary: Optional[float] = None
 
     @field_validator("employee_type", mode="before")
     @classmethod

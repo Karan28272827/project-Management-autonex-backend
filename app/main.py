@@ -4,7 +4,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +23,7 @@ from app.api.notifications import router as notifications_router
 from app.api.wfh import router as wfh_router
 from app.api.signup_requests import router as signup_requests_router
 from app.api.referrals import router as referrals_router, external_router as referrals_external_router
+from app.api.payroll import router as payroll_router
 from app.seed_skills import seed_skills
 
 Base.metadata.create_all(bind=engine)
@@ -196,6 +197,21 @@ def sync_employee_type_values() -> None:
 
 
 sync_employee_type_values()
+
+
+def sync_employee_salary_schema() -> None:
+    """Backfill base_salary column on existing employee tables."""
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns("employees")}
+    except Exception:
+        return
+    if "base_salary" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE employees ADD COLUMN base_salary FLOAT"))
+
+
+sync_employee_salary_schema()
 seed_skills()
 
 app = FastAPI(title="Autonex Resource Planning Tool V2")
@@ -231,4 +247,5 @@ app.include_router(wfh_router)
 app.include_router(signup_requests_router)
 app.include_router(referrals_router)
 app.include_router(referrals_external_router)
+app.include_router(payroll_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
