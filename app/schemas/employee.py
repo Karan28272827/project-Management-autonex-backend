@@ -4,7 +4,7 @@ from datetime import datetime
 
 # Designation options
 DesignationType = Literal["Program Manager", "Annotator", "Developer", "QA", "Reviewer"]
-VALID_EMPLOYEE_TYPES = {"Full-time", "Part-time", "Intern", "Contract"}
+VALID_EMPLOYEE_TYPES = {"Full-time", "Part-time", "Intern", "Contract", "Contractor"}
 EMPLOYEE_TYPE_ALIASES = {
     "Full-Time": "Full-time",
     "Full Time": "Full-time",
@@ -12,6 +12,7 @@ EMPLOYEE_TYPE_ALIASES = {
     "Part Time": "Part-time",
     "Contract Based": "Contract",
     "Contract based": "Contract",
+    "Contractor": "Contractor",
 }
 
 
