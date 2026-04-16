@@ -17,7 +17,7 @@ class ParentProjectBase(BaseModel):
 
 class ParentProjectCreate(ParentProjectBase):
     """Schema for creating a new parent project."""
-    pass
+    program_manager_id: int = Field(..., description="Employee ID of Program Manager")
 
 
 class ParentProjectUpdate(BaseModel):

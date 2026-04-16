@@ -19,6 +19,7 @@ from app.schemas.allocation import (
 from app.services.allocation_validator import (
     validate_time_distribution,
     check_double_booking,
+    check_leave_conflict,
     get_all_employees_allocation_status
 )
 from app.services.slack_service import (
@@ -231,7 +232,17 @@ def validate_allocation(
     
     if booking_check.get('is_overbooked'):
         warnings.append(booking_check['message'])
-    
+
+    # Leave-conflict check
+    leave_check = check_leave_conflict(
+        db=db,
+        employee_id=data.employee_id,
+        alloc_start=data.active_start_date,
+        alloc_end=data.active_end_date,
+    )
+    if leave_check["has_conflict"]:
+        errors.append(leave_check["message"])
+
     return AllocationValidationResponse(
         is_valid=len(errors) == 0,
         time_distribution_valid=time_check['is_valid'],
@@ -274,7 +285,23 @@ def create_allocation(data: AllocationCreate, db: Session = Depends(get_db)):
                 "booking_details": booking_check
             }
         )
-    
+
+    # Leave-conflict check: block assignment if employee is on approved leave
+    leave_check = check_leave_conflict(
+        db=db,
+        employee_id=data.employee_id,
+        alloc_start=data.active_start_date,
+        alloc_end=data.active_end_date,
+    )
+    if leave_check["has_conflict"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": leave_check["message"],
+                "conflicting_leaves": leave_check["conflicting_leaves"],
+            }
+        )
+
     project = db.query(Project).filter(Project.id == data.sub_project_id).first()
     previous_count = 0
     if project:
@@ -441,7 +468,26 @@ def update_allocation(
                     "booking_details": booking_check
                 }
             )
-    
+
+    # Leave-conflict check on update (uses resolved employee / dates)
+    resolved_employee_id = data.employee_id or allocation.employee_id
+    resolved_start = data.active_start_date if data.active_start_date is not None else allocation.active_start_date
+    resolved_end   = data.active_end_date   if data.active_end_date   is not None else allocation.active_end_date
+    leave_check = check_leave_conflict(
+        db=db,
+        employee_id=resolved_employee_id,
+        alloc_start=resolved_start,
+        alloc_end=resolved_end,
+    )
+    if leave_check["has_conflict"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": leave_check["message"],
+                "conflicting_leaves": leave_check["conflicting_leaves"],
+            }
+        )
+
     old_sub_project_id = allocation.sub_project_id
 
     for key, value in data.model_dump(exclude_unset=True).items():

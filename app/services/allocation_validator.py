@@ -3,6 +3,7 @@ Allocation Validation Service
 Implements business logic for allocation validation including:
 - Sum-Zero validation (time distribution must equal total hours)
 - Double-booking detection across projects
+- Leave conflict detection (approved leave blocks assignment)
 """
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
@@ -11,6 +12,7 @@ from typing import List, Optional, Dict, Any
 
 from app.models.allocation import Allocation
 from app.models.employee import Employee
+from app.models.leave import Leave
 
 
 class AllocationValidationError(Exception):
@@ -20,6 +22,92 @@ class AllocationValidationError(Exception):
         self.error_type = error_type
         self.details = details or {}
         super().__init__(self.message)
+
+
+def check_leave_conflict(
+    db: Session,
+    employee_id: int,
+    alloc_start: Optional[date],
+    alloc_end: Optional[date],
+) -> Dict[str, Any]:
+    """
+    Leave-Conflict Check:
+    An employee with an *approved* leave that overlaps the allocation date range
+    must not be assigned to a project during that period.
+
+    Only approved leaves are considered; pending and rejected leaves are ignored.
+    If either alloc_start or alloc_end is None the check is skipped (open-ended
+    allocations cannot be compared to a leave date range).
+
+    Args:
+        db:           Database session
+        employee_id:  Employee to check
+        alloc_start:  Proposed allocation start date (inclusive)
+        alloc_end:    Proposed allocation end date (inclusive)
+
+    Returns:
+        {
+            'has_conflict': bool,
+            'employee_id': int,
+            'conflicting_leaves': [
+                {'leave_id': int, 'start_date': str, 'end_date': str, 'leave_type': str}
+            ],
+            'message': str
+        }
+    """
+    if alloc_start is None or alloc_end is None:
+        return {
+            "has_conflict": False,
+            "employee_id": employee_id,
+            "conflicting_leaves": [],
+            "message": "No date range provided; leave conflict check skipped",
+        }
+
+    # Find approved leaves whose date range overlaps [alloc_start, alloc_end].
+    # Two ranges [A,B] and [C,D] overlap when A <= D and C <= B.
+    conflicting = (
+        db.query(Leave)
+        .filter(
+            Leave.employee_id == employee_id,
+            Leave.status == "approved",
+            Leave.start_date <= alloc_end,
+            Leave.end_date >= alloc_start,
+        )
+        .all()
+    )
+
+    if not conflicting:
+        return {
+            "has_conflict": False,
+            "employee_id": employee_id,
+            "conflicting_leaves": [],
+            "message": "No leave conflicts found",
+        }
+
+    leave_details = [
+        {
+            "leave_id": lv.id,
+            "start_date": lv.start_date.isoformat(),
+            "end_date": lv.end_date.isoformat(),
+            "leave_type": lv.leave_type or "unknown",
+        }
+        for lv in conflicting
+    ]
+
+    date_strs = ", ".join(
+        f"{d['start_date']} to {d['end_date']}" for d in leave_details
+    )
+    message = (
+        f"Employee {employee_id} is on approved leave during the allocation period "
+        f"({date_strs}). Remove the leave or adjust the allocation dates."
+    )
+
+    return {
+        "has_conflict": True,
+        "employee_id": employee_id,
+        "conflicting_leaves": leave_details,
+        "message": message,
+    }
 
 
 def validate_time_distribution(
