@@ -1,25 +1,26 @@
 """
-Tests: Leave-Allocation Conflict Guard
-======================================
-Rule: An employee on approved leave (even for a single day) must NOT be
-assigned to any project during that leave period.
+Tests: Leave-Allocation Overlap Detection
+==========================================
+Policy: An employee on approved leave during a project period is STILL
+eligible for allocation. Leave days are simply excluded from their working
+availability in capacity calculations (handled by recommendation_service).
+The check_leave_conflict() function detects overlaps and returns them as
+informational warnings — it does NOT block the assignment.
 
-What is tested:
-  Unit tests (service layer) — check_leave_conflict()
-  ● approved leave fully covering allocation → blocked
-  ● approved leave partially overlapping allocation (start overlap) → blocked
-  ● approved leave partially overlapping allocation (end overlap) → blocked
-  ● single leave day inside allocation range → blocked
-  ● leave date exactly equal to allocation start → blocked
-  ● leave date exactly equal to allocation end → blocked
-  ● allocation outside leave range → allowed
-  ● pending leave overlapping → allowed (not yet approved)
-  ● rejected leave overlapping → allowed
-  ● no leave at all → allowed
-
-  Integration tests (API layer) — POST /api/allocations
-  ● approved leave overlap → 409 Conflict
-  ● no leave → 200 OK
+What is tested (service layer — check_leave_conflict()):
+  ● approved leave fully covering allocation → has_conflict=True (warning)
+  ● approved leave partially overlapping (start) → has_conflict=True
+  ● approved leave partially overlapping (end) → has_conflict=True
+  ● single leave day inside allocation range → has_conflict=True
+  ● leave date exactly equal to allocation start (boundary) → has_conflict=True
+  ● leave date exactly equal to allocation end (boundary) → has_conflict=True
+  ● allocation completely before leave → no conflict
+  ● allocation completely after leave → no conflict
+  ● pending leave overlapping → no conflict (only approved leaves matter)
+  ● rejected leave overlapping → no conflict
+  ● no leave at all → no conflict
+  ● conflict result contains leave details for display
+  ● no date range supplied → no conflict (check skipped)
 """
 
 import pytest
@@ -127,9 +128,15 @@ LEAVE_END   = TODAY + timedelta(days=14)   # 5-day leave
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestCheckLeaveConflict:
+    """
+    Tests for check_leave_conflict() detection logic.
+    has_conflict=True means the overlap was detected and should surface as a
+    warning to the caller. The API layer no longer blocks on this — it allows
+    the allocation and excludes leave days from capacity calculations.
+    """
 
     def test_approved_leave_fully_covers_allocation(self, db, employee):
-        """Allocation range sits entirely inside the leave period → conflict."""
+        """Allocation range sits entirely inside the leave period → conflict detected."""
         leave = make_leave(db, employee.id, LEAVE_START, LEAVE_END)
         alloc_start = LEAVE_START + timedelta(days=1)
         alloc_end   = LEAVE_START + timedelta(days=2)

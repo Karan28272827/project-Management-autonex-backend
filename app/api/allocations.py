@@ -233,7 +233,8 @@ def validate_allocation(
     if booking_check.get('is_overbooked'):
         warnings.append(booking_check['message'])
 
-    # Leave-conflict check
+    # Leave-overlap check: informational warning only — leave days are
+    # automatically excluded from capacity calculations downstream.
     leave_check = check_leave_conflict(
         db=db,
         employee_id=data.employee_id,
@@ -241,7 +242,7 @@ def validate_allocation(
         alloc_end=data.active_end_date,
     )
     if leave_check["has_conflict"]:
-        errors.append(leave_check["message"])
+        warnings.append(leave_check["message"])
 
     return AllocationValidationResponse(
         is_valid=len(errors) == 0,
@@ -286,21 +287,14 @@ def create_allocation(data: AllocationCreate, db: Session = Depends(get_db)):
             }
         )
 
-    # Leave-conflict check: block assignment if employee is on approved leave
+    # Leave-overlap check: informational only — leave days are excluded from
+    # capacity calculations automatically; assignment is still permitted.
     leave_check = check_leave_conflict(
         db=db,
         employee_id=data.employee_id,
         alloc_start=data.active_start_date,
         alloc_end=data.active_end_date,
     )
-    if leave_check["has_conflict"]:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": leave_check["message"],
-                "conflicting_leaves": leave_check["conflicting_leaves"],
-            }
-        )
 
     project = db.query(Project).filter(Project.id == data.sub_project_id).first()
     previous_count = 0
@@ -339,8 +333,14 @@ def create_allocation(data: AllocationCreate, db: Session = Depends(get_db)):
         )
     except Exception:
         pass
-    
-    return enrich_allocation_response(allocation, db)
+
+    response = enrich_allocation_response(allocation, db)
+    if leave_check["has_conflict"]:
+        response["leave_warning"] = {
+            "message": leave_check["message"],
+            "excluded_leaves": leave_check["conflicting_leaves"],
+        }
+    return response
 
 
 @router.get("", response_model=List[dict])
@@ -469,7 +469,7 @@ def update_allocation(
                 }
             )
 
-    # Leave-conflict check on update (uses resolved employee / dates)
+    # Leave-overlap check on update: informational only.
     resolved_employee_id = data.employee_id or allocation.employee_id
     resolved_start = data.active_start_date if data.active_start_date is not None else allocation.active_start_date
     resolved_end   = data.active_end_date   if data.active_end_date   is not None else allocation.active_end_date
@@ -479,14 +479,6 @@ def update_allocation(
         alloc_start=resolved_start,
         alloc_end=resolved_end,
     )
-    if leave_check["has_conflict"]:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": leave_check["message"],
-                "conflicting_leaves": leave_check["conflicting_leaves"],
-            }
-        )
 
     old_sub_project_id = allocation.sub_project_id
 
@@ -511,8 +503,14 @@ def update_allocation(
 
     db.commit()
     db.refresh(allocation)
-    
-    return enrich_allocation_response(allocation, db)
+
+    response = enrich_allocation_response(allocation, db)
+    if leave_check["has_conflict"]:
+        response["leave_warning"] = {
+            "message": leave_check["message"],
+            "excluded_leaves": leave_check["conflicting_leaves"],
+        }
+    return response
 
 
 @router.delete("/{allocation_id}")

@@ -17,6 +17,7 @@ def main() -> None:
             "type": "attendance",
             "sub-type": "modify",
         },
+        
         "data": {
             "email": sample_email,
             "date": sample_date,
