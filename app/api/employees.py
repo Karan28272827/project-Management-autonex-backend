@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
@@ -8,6 +10,7 @@ from app.models.employee import Employee
 from app.models.leave import Leave
 from app.models.side_project import SideProject
 from app.models.user import User
+from app.models.wfh import WFHRequest
 from app.schemas.employee import (
     EmployeeCreate,
     EmployeeUpdate,
@@ -155,3 +158,112 @@ def delete_employee(
     except SQLAlchemyError:
         db.rollback()
         raise HTTPException(status_code=500, detail="Failed to delete employee and related records")
+
+
+# ✅ EMPLOYEE AVAILABILITY (±30 days)
+@router.get("/{employee_id}/availability")
+def get_employee_availability(employee_id: int, db: Session = Depends(get_db)):
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    today = date.today()
+    next_30 = today + timedelta(days=30)
+    past_30 = today - timedelta(days=30)
+
+    upcoming_leaves = (
+        db.query(Leave)
+        .filter(
+            Leave.employee_id == employee_id,
+            Leave.status != "rejected",
+            Leave.end_date >= today,
+            Leave.start_date <= next_30,
+        )
+        .order_by(Leave.start_date)
+        .all()
+    )
+
+    past_leaves = (
+        db.query(Leave)
+        .filter(
+            Leave.employee_id == employee_id,
+            Leave.status != "rejected",
+            Leave.end_date >= past_30,
+            Leave.end_date < today,
+        )
+        .order_by(Leave.start_date.desc())
+        .all()
+    )
+
+    upcoming_wfh = (
+        db.query(WFHRequest)
+        .filter(
+            WFHRequest.employee_id == employee_id,
+            WFHRequest.status != "rejected",
+            WFHRequest.wfh_date >= today,
+            WFHRequest.wfh_date <= next_30,
+        )
+        .order_by(WFHRequest.wfh_date)
+        .all()
+    )
+
+    past_wfh = (
+        db.query(WFHRequest)
+        .filter(
+            WFHRequest.employee_id == employee_id,
+            WFHRequest.status != "rejected",
+            WFHRequest.wfh_date >= past_30,
+            WFHRequest.wfh_date < today,
+        )
+        .order_by(WFHRequest.wfh_date.desc())
+        .all()
+    )
+
+    def expand_leave(leave):
+        days = []
+        d = leave.start_date
+        while d <= leave.end_date:
+            if d >= today:
+                days.append(d.isoformat())
+            d += timedelta(days=1)
+        return {
+            "leave_id": leave.id,
+            "start_date": leave.start_date.isoformat(),
+            "end_date": leave.end_date.isoformat(),
+            "leave_type": leave.leave_type,
+            "status": leave.status,
+            "reason": leave.reason,
+            "days": days,
+        }
+
+    def format_past_leave(leave):
+        return {
+            "leave_id": leave.id,
+            "start_date": leave.start_date.isoformat(),
+            "end_date": leave.end_date.isoformat(),
+            "leave_type": leave.leave_type,
+            "status": leave.status,
+            "reason": leave.reason,
+        }
+
+    upcoming_leave_items = [expand_leave(l) for l in upcoming_leaves]
+
+    return {
+        "employee_id": employee.id,
+        "employee_name": employee.name,
+        "employee_email": employee.email,
+        "designation": employee.designation,
+        "status": employee.status,
+        "today": today.isoformat(),
+        "available_next_30_days": len(upcoming_leave_items) == 0,
+        "upcoming_leaves": upcoming_leave_items,
+        "upcoming_wfh": [
+            {"id": w.id, "date": w.wfh_date.isoformat(), "status": w.status, "reason": w.reason}
+            for w in upcoming_wfh
+        ],
+        "past_leaves": [format_past_leave(l) for l in past_leaves],
+        "past_wfh": [
+            {"id": w.id, "date": w.wfh_date.isoformat(), "status": w.status, "reason": w.reason}
+            for w in past_wfh
+        ],
+    }
