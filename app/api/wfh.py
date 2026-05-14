@@ -20,7 +20,8 @@ router = APIRouter(prefix="/api/wfh", tags=["wfh"])
 
 class WFHCreate(BaseModel):
     employee_id: int
-    wfh_date: date
+    wfh_date: date          # start date
+    end_date: Optional[date] = None   # defaults to wfh_date for single-day
     reason: Optional[str] = None
 
 
@@ -28,6 +29,7 @@ class WFHResponse(BaseModel):
     id: int
     employee_id: int
     wfh_date: date
+    end_date: Optional[date] = None
     reason: Optional[str] = None
     status: str
     approved_by: Optional[int] = None
@@ -53,6 +55,7 @@ def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
         id=req.id,
         employee_id=req.employee_id,
         wfh_date=req.wfh_date,
+        end_date=req.end_date or req.wfh_date,
         reason=req.reason,
         status=req.status,
         approved_by=req.approved_by,
@@ -95,6 +98,7 @@ def get_wfh_requests(
             id=req.id,
             employee_id=req.employee_id,
             wfh_date=req.wfh_date,
+            end_date=req.end_date or req.wfh_date,
             reason=req.reason,
             status=req.status,
             approved_by=req.approved_by,
@@ -112,18 +116,28 @@ def create_wfh_request(payload: WFHCreate, db: Session = Depends(get_db)):
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    # Check for duplicate WFH on same date
-    existing = db.query(WFHRequest).filter(
+    end_date = payload.end_date or payload.wfh_date
+    if end_date < payload.wfh_date:
+        raise HTTPException(status_code=400, detail="End date cannot be before start date")
+
+    # Check for overlap with existing non-rejected WFH requests
+    overlap = db.query(WFHRequest).filter(
         WFHRequest.employee_id == payload.employee_id,
-        WFHRequest.wfh_date == payload.wfh_date,
         WFHRequest.status != "rejected",
+        WFHRequest.wfh_date <= end_date,
+        (WFHRequest.end_date >= payload.wfh_date) | (WFHRequest.wfh_date >= payload.wfh_date),
     ).first()
-    if existing:
-        raise HTTPException(status_code=409, detail=f"A WFH request already exists for {payload.wfh_date}.")
+    if overlap:
+        overlap_end = overlap.end_date or overlap.wfh_date
+        raise HTTPException(
+            status_code=409,
+            detail=f"A WFH request already exists overlapping this period ({overlap.wfh_date} – {overlap_end}).",
+        )
 
     req = WFHRequest(
         employee_id=payload.employee_id,
         wfh_date=payload.wfh_date,
+        end_date=end_date,
         reason=payload.reason,
         status="pending",
     )
@@ -218,17 +232,27 @@ def update_wfh_request(wfh_id: int, payload: WFHCreate, db: Session = Depends(ge
     if req.wfh_date <= date.today():
         raise HTTPException(status_code=400, detail="Cannot edit a WFH request on or after its date")
 
-    # Check for duplicate on the new date (excluding this request)
-    duplicate = db.query(WFHRequest).filter(
+    end_date = payload.end_date or payload.wfh_date
+    if end_date < payload.wfh_date:
+        raise HTTPException(status_code=400, detail="End date cannot be before start date")
+
+    # Check for overlap with other non-rejected WFH requests (excluding this one)
+    overlap = db.query(WFHRequest).filter(
         WFHRequest.employee_id == req.employee_id,
         WFHRequest.id != wfh_id,
-        WFHRequest.wfh_date == payload.wfh_date,
         WFHRequest.status != "rejected",
+        WFHRequest.wfh_date <= end_date,
+        (WFHRequest.end_date >= payload.wfh_date) | (WFHRequest.wfh_date >= payload.wfh_date),
     ).first()
-    if duplicate:
-        raise HTTPException(status_code=409, detail=f"A WFH request already exists for {payload.wfh_date}.")
+    if overlap:
+        overlap_end = overlap.end_date or overlap.wfh_date
+        raise HTTPException(
+            status_code=409,
+            detail=f"A WFH request already exists overlapping this period ({overlap.wfh_date} – {overlap_end}).",
+        )
 
     req.wfh_date = payload.wfh_date
+    req.end_date = end_date
     req.reason = payload.reason
     req.status = "pending"  # reset so manager re-reviews
     db.commit()

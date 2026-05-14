@@ -215,6 +215,22 @@ def sync_employee_salary_schema() -> None:
 sync_employee_salary_schema()
 
 
+def sync_wfh_end_date_schema() -> None:
+    """Add end_date column to wfh_requests and backfill existing rows."""
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns("wfh_requests")}
+    except Exception:
+        return
+    if "end_date" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE wfh_requests ADD COLUMN end_date DATE"))
+            connection.execute(text("UPDATE wfh_requests SET end_date = wfh_date WHERE end_date IS NULL"))
+
+
+sync_wfh_end_date_schema()
+
+
 def sync_performance_reviews_schema() -> None:
     """Create the performance_reviews table on existing databases if missing."""
     inspector = inspect(engine)
