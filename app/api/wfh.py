@@ -209,11 +209,40 @@ def reject_wfh(
     return {"message": "WFH request rejected", "wfh_id": wfh_id, "status": "rejected"}
 
 
+@router.put("/{wfh_id}", response_model=WFHResponse)
+def update_wfh_request(wfh_id: int, payload: WFHCreate, db: Session = Depends(get_db)):
+    """Edit a WFH request. Only allowed before the WFH date."""
+    req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="WFH request not found")
+    if req.wfh_date <= date.today():
+        raise HTTPException(status_code=400, detail="Cannot edit a WFH request on or after its date")
+
+    # Check for duplicate on the new date (excluding this request)
+    duplicate = db.query(WFHRequest).filter(
+        WFHRequest.employee_id == req.employee_id,
+        WFHRequest.id != wfh_id,
+        WFHRequest.wfh_date == payload.wfh_date,
+        WFHRequest.status != "rejected",
+    ).first()
+    if duplicate:
+        raise HTTPException(status_code=409, detail=f"A WFH request already exists for {payload.wfh_date}.")
+
+    req.wfh_date = payload.wfh_date
+    req.reason = payload.reason
+    req.status = "pending"  # reset so manager re-reviews
+    db.commit()
+    db.refresh(req)
+    return _build_response(req, db)
+
+
 @router.delete("/{wfh_id}")
 def delete_wfh(wfh_id: int, db: Session = Depends(get_db)):
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
+    if req.wfh_date <= date.today():
+        raise HTTPException(status_code=400, detail="Cannot delete a WFH request on or after its date")
     db.delete(req)
     db.commit()
     return {"message": "WFH request deleted"}
