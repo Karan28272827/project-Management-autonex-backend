@@ -10,7 +10,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 from app.db.database import get_db
-from app.constants.leave_types import RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type
+from app.constants.leave_types import RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type, is_valid_floater_date, get_floater_dates_for_year
 from app.models.allocation import Allocation
 from app.models.employee import Employee
 from app.models.leave import Leave
@@ -386,6 +386,25 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
             detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}). Please check your existing leaves.",
         )
 
+    # Floater leave date validation
+    normalized_type = normalize_leave_type(payload.leave_type)
+    if normalized_type == "floater":
+        check_date = payload.start_date
+        while check_date <= payload.end_date:
+            if not is_valid_floater_date(check_date):
+                approved = sorted(get_floater_dates_for_year(payload.start_date.year))
+                if not approved:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Floater leave is not available for {payload.start_date.year}. No approved floater dates have been configured.",
+                    )
+                approved_str = ", ".join(str(d) for d in approved)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{check_date} is not an approved floater holiday date. Approved dates for {check_date.year}: {approved_str}",
+                )
+            check_date += timedelta(days=1)
+
     # Monthly paid leave limit: max 2 paid leaves per calendar month
     flagged = False
     if payload.leave_type == "paid":
@@ -550,6 +569,25 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
             status_code=409,
             detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}).",
         )
+
+    # Floater leave date validation
+    normalized_type = normalize_leave_type(payload.leave_type)
+    if normalized_type == "floater":
+        check_date = payload.start_date
+        while check_date <= payload.end_date:
+            if not is_valid_floater_date(check_date):
+                approved = sorted(get_floater_dates_for_year(payload.start_date.year))
+                if not approved:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Floater leave is not available for {payload.start_date.year}. No approved floater dates have been configured.",
+                    )
+                approved_str = ", ".join(str(d) for d in approved)
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{check_date} is not an approved floater holiday date. Approved dates for {check_date.year}: {approved_str}",
+                )
+            check_date += timedelta(days=1)
 
     leave.start_date = payload.start_date
     leave.end_date = payload.end_date
