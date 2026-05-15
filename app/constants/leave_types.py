@@ -65,6 +65,10 @@ FLOATER_DATES_BY_YEAR: dict[int, frozenset[date]] = {
     2026: FLOATER_DATES_2026,
 }
 
+FIXED_HOLIDAYS_BY_YEAR: dict[int, frozenset[date]] = {
+    2026: FIXED_HOLIDAYS_2026,
+}
+
 
 def get_floater_dates_for_year(year: int) -> frozenset[date]:
     return FLOATER_DATES_BY_YEAR.get(year, frozenset())
@@ -72,6 +76,22 @@ def get_floater_dates_for_year(year: int) -> frozenset[date]:
 
 def is_valid_floater_date(d: date) -> bool:
     return d in get_floater_dates_for_year(d.year)
+
+
+def get_fixed_holidays_for_year(year: int) -> frozenset[date]:
+    return FIXED_HOLIDAYS_BY_YEAR.get(year, frozenset())
+
+
+def is_fixed_holiday(d: date) -> bool:
+    return d in get_fixed_holidays_for_year(d.year)
+
+
+def is_weekend(d: date) -> bool:
+    return d.weekday() >= 5  # 5 = Saturday, 6 = Sunday
+
+
+def is_non_working_day(d: date) -> bool:
+    return is_weekend(d) or is_fixed_holiday(d)
 
 
 def normalize_leave_type(leave_type: str) -> str:

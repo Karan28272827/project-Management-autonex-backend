@@ -10,7 +10,11 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 from app.db.database import get_db
-from app.constants.leave_types import RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type, is_valid_floater_date, get_floater_dates_for_year
+from app.constants.leave_types import (
+    RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type,
+    is_valid_floater_date, get_floater_dates_for_year,
+    is_weekend, is_fixed_holiday, get_fixed_holidays_for_year,
+)
 from app.models.allocation import Allocation
 from app.models.employee import Employee
 from app.models.leave import Leave
@@ -386,6 +390,23 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
             detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}). Please check your existing leaves.",
         )
 
+    # Weekend and fixed public holiday validation
+    check_date = payload.start_date
+    while check_date <= payload.end_date:
+        if is_weekend(check_date):
+            day_name = "Saturday" if check_date.weekday() == 5 else "Sunday"
+            raise HTTPException(
+                status_code=400,
+                detail=f"{check_date} is a {day_name}. Leave cannot be applied on weekends.",
+            )
+        if is_fixed_holiday(check_date):
+            fixed = sorted(get_fixed_holidays_for_year(check_date.year))
+            raise HTTPException(
+                status_code=400,
+                detail=f"{check_date} is a fixed public holiday. Leave cannot be applied on fixed public holidays.",
+            )
+        check_date += timedelta(days=1)
+
     # Floater leave date validation
     normalized_type = normalize_leave_type(payload.leave_type)
     if normalized_type == "floater":
@@ -569,6 +590,22 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
             status_code=409,
             detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}).",
         )
+
+    # Weekend and fixed public holiday validation
+    check_date = payload.start_date
+    while check_date <= payload.end_date:
+        if is_weekend(check_date):
+            day_name = "Saturday" if check_date.weekday() == 5 else "Sunday"
+            raise HTTPException(
+                status_code=400,
+                detail=f"{check_date} is a {day_name}. Leave cannot be applied on weekends.",
+            )
+        if is_fixed_holiday(check_date):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{check_date} is a fixed public holiday. Leave cannot be applied on fixed public holidays.",
+            )
+        check_date += timedelta(days=1)
 
     # Floater leave date validation
     normalized_type = normalize_leave_type(payload.leave_type)
