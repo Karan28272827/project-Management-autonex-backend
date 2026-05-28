@@ -48,6 +48,8 @@ Thumbs.db
 
 # One-off utility / seed scripts
 import_employees_to_users.py
+migrate_employee_types.py
+migrate_terminology.py
 seed_admin.py
 sync_excel_full.py
 sync_roles_to_tables.py
