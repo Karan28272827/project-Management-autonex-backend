@@ -391,6 +391,18 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
             detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}). Please check your existing leaves.",
         )
 
+    # Reject if the entire range contains no working days
+    working_day_count = sum(
+        1 for i in range((payload.end_date - payload.start_date).days + 1)
+        if not is_weekend(payload.start_date + timedelta(days=i))
+        and not is_fixed_holiday(payload.start_date + timedelta(days=i))
+    )
+    if working_day_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="The selected date range contains no working days. Please choose dates that include at least one working day.",
+        )
+
     # Floater leave date validation
     normalized_type = normalize_leave_type(payload.leave_type)
     if normalized_type == "floater":
@@ -573,6 +585,18 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
         raise HTTPException(
             status_code=409,
             detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}).",
+        )
+
+    # Reject if the entire range contains no working days
+    working_day_count = sum(
+        1 for i in range((payload.end_date - payload.start_date).days + 1)
+        if not is_weekend(payload.start_date + timedelta(days=i))
+        and not is_fixed_holiday(payload.start_date + timedelta(days=i))
+    )
+    if working_day_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="The selected date range contains no working days. Please choose dates that include at least one working day.",
         )
 
     # Floater leave date validation
