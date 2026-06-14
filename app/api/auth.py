@@ -158,16 +158,37 @@ def signup(body: SignupRequest, db: Session = Depends(get_db)):
     # Only allow 'employee' or 'pm' via signup; admin is seed-only
     role = body.role if body.role in ("employee", "pm") else "employee"
 
-    employee = Employee(
-        name=body.name,
-        email=body.email,
-        employee_type="Full-time",
-        designation="Program Manager" if role == "pm" else "Annotator/ Reviewer",
-        skills=body.skills or [],
-        status="active",
+    # Guard: check if this email already belongs to an existing employee record
+    # (either as primary email or as razorpay_email) before creating a new one.
+    # This prevents duplicate employee profiles when someone signs up with the
+    # same email that is already stored in a different email field.
+    employee = (
+        db.query(Employee)
+        .filter(
+            (Employee.email == body.email) |
+            (Employee.razorpay_email == body.email)
+        )
+        .first()
     )
-    db.add(employee)
-    db.flush()
+
+    if employee is None:
+        # No existing employee record — create a fresh one.
+        employee = Employee(
+            name=body.name,
+            email=body.email,
+            employee_type="Full-time",
+            designation="Program Manager" if role == "pm" else "Annotator/ Reviewer",
+            skills=body.skills or [],
+            status="active",
+        )
+        db.add(employee)
+        db.flush()
+        logger.info("[signup] Created new employee id=%s for email=%s", employee.id, body.email)
+    else:
+        logger.info(
+            "[signup] Reusing existing employee id=%s (email=%s, razorpay_email=%s) for new user email=%s",
+            employee.id, employee.email, employee.razorpay_email, body.email,
+        )
 
     user = User(
         name=body.name,
@@ -216,11 +237,21 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         logger.warning("[login] Deactivated account: email=%s", body.email)
         raise HTTPException(status_code=403, detail="Account is deactivated")
 
-    # Auto-link PM/employee users to an Employee record if not yet linked
+    # Auto-link PM/employee users to an Employee record if not yet linked.
+    # We search by both primary email AND razorpay_email so that a user whose
+    # login credential email matches a razorpay_email on an existing employee
+    # profile is correctly linked instead of getting a brand-new duplicate row.
     if user.employee_id is None:
-        employee = db.query(Employee).filter(Employee.email == user.email).first()
+        employee = (
+            db.query(Employee)
+            .filter(
+                (Employee.email == user.email) |
+                (Employee.razorpay_email == user.email)
+            )
+            .first()
+        )
         if employee is None and user.role in ("pm", "employee"):
-            # Create a fresh Employee record for this user
+            # Truly no matching employee record exists — create one.
             employee = Employee(
                 name=user.name,
                 email=user.email,
@@ -230,6 +261,7 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
             )
             db.add(employee)
             db.flush()
+            logger.info("[login] Created new employee id=%s for unlinked user id=%s", employee.id, user.id)
         if employee is not None:
             user.employee_id = employee.id
             db.commit()
