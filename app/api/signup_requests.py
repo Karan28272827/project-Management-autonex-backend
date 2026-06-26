@@ -22,6 +22,7 @@ from app.models.notification import Notification
 from app.models.signup_request import SignupRequest
 from app.models.user import User
 from app.services.email_service import try_send_signup_approved_email, try_send_signup_rejected_email
+from app.services.identity_validator import check_duplicate_identity
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/signup-requests", tags=["signup-requests"])
@@ -98,20 +99,17 @@ def _to_response(req: SignupRequest) -> SignupRequestResponse:
 @router.post("", response_model=SignupRequestResponse, status_code=201)
 def submit_signup_request(payload: SignupRequestCreate, db: Session = Depends(get_db)):
     """Public endpoint — anyone can submit a signup request."""
-    # Check duplicate in users table
-    if db.query(User).filter(User.email == payload.email).first():
-        raise HTTPException(status_code=409, detail="An account with this email already exists.")
-
-    # Check duplicate pending/approved request
-    existing = db.query(SignupRequest).filter(SignupRequest.email == payload.email).first()
-    if existing:
-        if existing.status == "pending":
-            raise HTTPException(status_code=409, detail="A signup request for this email is already pending review.")
-        if existing.status == "approved":
-            raise HTTPException(status_code=409, detail="This email has already been approved. Please sign in.")
-        # Rejected — allow re-application by deleting old record
-        db.delete(existing)
+    # Clean up old rejected signup request if it exists, to allow re-application
+    existing_rejected = db.query(SignupRequest).filter(
+        SignupRequest.email == payload.email,
+        SignupRequest.status == "rejected"
+    ).first()
+    if existing_rejected:
+        db.delete(existing_rejected)
         db.flush()
+
+    # Enforce unique identity check
+    check_duplicate_identity(db, email=payload.email, phone=payload.phone)
 
     req = SignupRequest(
         name=payload.name,
@@ -168,9 +166,13 @@ def approve_signup_request(
     if req.status != "pending":
         raise HTTPException(status_code=400, detail=f"Request is already {req.status}")
 
-    # Guard: email must not have been registered in the meantime
-    if db.query(User).filter(User.email == req.email).first():
-        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+    # Guard: ensure no conflict exists before approving
+    check_duplicate_identity(
+        db,
+        email=req.email,
+        phone=req.phone,
+        exclude_signup_request_id=request_id
+    )
 
     # Create Employee record
     employee = Employee(
@@ -235,6 +237,35 @@ def approve_signup_request(
         "employee_id": employee.id,
         "user_id": user.id,
     }
+
+
+class UpdateSignupRequest(BaseModel):
+    employee_type: Optional[str] = None
+    designation: Optional[str] = None
+
+
+@router.patch("/{request_id}", response_model=SignupRequestResponse)
+def update_signup_request(
+    request_id: int,
+    payload: UpdateSignupRequest,
+    db: Session = Depends(get_db),
+):
+    """Update editable fields (employee_type, designation) on a pending signup request."""
+    req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Signup request not found")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail="Only pending requests can be edited")
+
+    if payload.employee_type is not None:
+        req.employee_type = payload.employee_type
+    if payload.designation is not None:
+        req.designation = payload.designation
+
+    db.commit()
+    db.refresh(req)
+    logger.info("[signup-request] Updated id=%s employee_type=%s", req.id, req.employee_type)
+    return _to_response(req)
 
 
 @router.patch("/{request_id}/reject")
